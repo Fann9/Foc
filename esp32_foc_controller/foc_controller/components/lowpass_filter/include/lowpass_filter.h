@@ -23,6 +23,9 @@ public:
      */
     float operator()(float x);
 
+    // 清空历史状态；控制模式重新建立零点时避免残留输出造成冲击。
+    void reset(float value = 0.0f);
+
     float Tf;  // 低通滤波时间常数
 
 private:

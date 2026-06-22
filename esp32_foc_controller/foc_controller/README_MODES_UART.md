@@ -1,6 +1,6 @@
 # 双电机控制模式与 UART 协议
 
-本文档说明双电机控制模式、M0 主输入/M1 从电机调速逻辑，以及 USB 控制台和 UART1 共用的文本命令协议。
+本文档说明双电机控制模式、单向主从调速、双向电子轴力反馈，以及 USB 控制台和 UART1 共用的文本命令协议。
 
 ## 模式选择
 
@@ -9,8 +9,9 @@
 ```cpp
 #define CONTROL_MODE_DUAL_VELOCITY       0
 #define CONTROL_MODE_MASTER_SLAVE_SPEED  1
+#define CONTROL_MODE_BILATERAL_COUPLING  2
 
-#define CONTROL_MODE CONTROL_MODE_MASTER_SLAVE_SPEED
+#define CONTROL_MODE CONTROL_MODE_BILATERAL_COUPLING
 ```
 
 ### DUAL_VELOCITY
@@ -52,6 +53,49 @@ MAX  = 10rad/s       M1 最高目标速度
 
 在上限继续正转不会增加目标，在下限继续反转不会产生负目标。退出上下限后，反方向输入立即有效。
 
+### BILATERAL_COUPLING
+
+M0、M1 组成对称的双向电子轴，两台电机都可以作为输入，也都可以作为输出：
+
+```text
+M0/M1 位置与速度差 → 虚拟弹簧阻尼 → -Iq 给 M0
+                                      → +Iq 给 M1
+                          两路 Iq → 各自电流 PID → FOC/PWM
+```
+
+耦合电流计算为：
+
+```text
+位置误差 E  = M0相对位置 - M1相对位置 / RATIO
+速度误差 DE = (E - 上一周期E) / dt，再经过5ms低通滤波
+Iq = KP × 限幅(E) + KD × DE
+```
+
+- 转动任意一台电机，另一台都会追随。
+- 一台电机受到阻挡后，位置误差会产生大小相同、方向相反的两路 Iq，阻力会反馈到另一台电机。
+- 此模式不使用速度 PID，只有虚拟联轴器和两台电流 PID。
+- 上电完成两台电机对齐后保持 `STOP`，不会主动产生耦合力。
+- `RUN M0`、`RUN M1` 和 `RUN ALL` 均会成对启动两台电机，并以启动瞬间的位置建立同步零点。
+- 任意 `STOP` 命令也会成对停止两台电机，防止只驱动一侧。
+- `ZERO LINK` 使用当前位置重新建立同步零点，不会要求电机回到上电位置。
+
+默认参数：
+
+```text
+KP      = 0.80A/rad
+KD      = 0.030A/(rad/s)
+CURRENT = 0.15A
+RAMP    = 10.0A/s
+RATIO   = 1.0
+位置误差参与计算的硬限制 = ±1.5rad
+位置软死区 = 0.005rad
+相对速度软死区 = 0.05rad/s
+```
+
+双向模式参考第九章力位闭环，默认电流 PID 使用 `P=1.25、I=50、D=0`，电流低通时间常数为 `10ms`。其他两个模式仍使用已经验证的 `P=0.5、I=50` 和 `50ms` 电流滤波。
+
+`RATIO=1` 表示两台电机相对转角相同，此时固件使用 `Iq0=-Iq`、`Iq1=+Iq` 近似实现相同的轴端反作用力。负值可以反转跟随方向；非 1 传动比时 M1 电流会按比例换算并再次限流。机械摩擦、电流零偏和电机转矩常数误差仍会影响实际手感。
+
 ## 串口配置
 
 ```text
@@ -85,6 +129,8 @@ STOP ALL
 
 在 `DUAL_VELOCITY` 模式中，M0/M1 都表示对应电机的闭环启停。
 
+在 `BILATERAL_COUPLING` 模式中，电子轴必须作为整体启停，因此 M0、M1、ALL 三种电机选择写法都会被接受，但效果相同。
+
 ## 设置目标速度
 
 ```text
@@ -100,6 +146,12 @@ SET M1 VEL 4
 ```
 
 主从模式会自动把直接设置的 M1 目标限制到 `0～LINK MAX`。
+
+双向电子轴模式没有速度目标，使用 `SET ... VEL` 会返回：
+
+```text
+ERR LINK_MODE_ONLY
+```
 
 ## 设置 PID
 
@@ -146,6 +198,40 @@ GET LINK
 
 ```text
 LINK GAIN=5.000 MAX=10.000 TARGET=2.500 PENDING=0.0040
+```
+
+## 设置双向电子轴参数
+
+可以逐项设置：
+
+```text
+SET LINK KP 0.8
+SET LINK KD 0.03
+SET LINK CURRENT 0.15
+SET LINK RAMP 10
+SET LINK RATIO 1.0
+```
+
+也可以一次设置 KP、KD、最大电流和传动比：
+
+```text
+SET LINK PARAM 0.8 0.03 0.15 1.0
+```
+
+参数范围：
+
+```text
+KP       0～10A/rad
+KD       0～1A/(rad/s)
+CURRENT  (0,1]A
+RAMP     (0,100]A/s
+RATIO    -10～-0.1 或 0.1～10
+```
+
+修改 `RATIO` 或整组 `PARAM` 时会自动以当前位置重新建立同步零点。`GET LINK` 返回示例：
+
+```text
+LINK KP=0.8000 KD=0.0300 CURRENT=0.150 RAMP=10.000 RATIO=1.000 E=0.0250 DE_RAW=0.420 DE=0.310 IQ_REQ=0.029 IQ=0.029
 ```
 
 ## 查询
@@ -201,6 +287,7 @@ ERR BAD_MOTOR
 ERR BAD_VALUE
 ERR ARG_COUNT
 ERR M0_INPUT_ONLY
+ERR LINK_MODE_ONLY
 ERR LINE_TOO_LONG
 ERR BUSY
 ```
@@ -217,3 +304,18 @@ ERR BUSY
 6. 正转到上限，确认目标不超过 `10rad/s`。
 7. 输入 `ZERO LINK`，确认 M1 减速至停止。
 8. 输入 `STOP ALL`，确认手轮输入暂停且 M1 无控制输出。
+
+## 双向电子轴首次测试
+
+1. 让两个电机轴都处于可以自由转动的状态，上电时不要用手握住电机。
+2. 等待两台电机依次完成电角度对齐，确认日志显示 `MODE BILATERAL_COUPLING` 且两台状态均为 `STOP`。
+3. 输入 `GET LINK`，确认默认最大电流为 `0.150A`。
+4. 输入 `RUN ALL`；命令生效瞬间会自动把当前位置设为同步零点。
+5. 很慢地转动 M0 小角度，确认 M1 同向跟随；再反向测试 M1 带动 M0。
+6. 如果另一台电机反向运动，立即输入 `STOP ALL`，然后使用 `SET LINK RATIO -1` 后重新测试。
+7. 轻轻捏住 M1，再小幅转动 M0，确认 M0 阻力增加；交换 M0/M1 重复测试。
+8. 输入 `GET LINK` 和 `GET ALL STATE`，正常情况下 `M0 IQ_T` 与 `M1 IQ_T` 大小相同、符号相反，链接 `IQ` 不超过设定的 `CURRENT`。`DE_RAW` 是位置差直接求导，`DE` 是参与控制的滤波值。
+9. 稳定后再逐步提高 `KP` 或 `CURRENT`；出现高频振动时先增大少量 `KD`，仍振动则降低 `KP`。
+10. 测试结束输入 `STOP ALL`。
+
+首次测试不要直接提高到 `0.5A`，也不要在一台电机被完全锁死时长时间保持较大的位置差。

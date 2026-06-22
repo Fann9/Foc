@@ -6,7 +6,8 @@
 // ==================== 控制模式切换 ====================
 #define CONTROL_MODE_DUAL_VELOCITY       0 // M0/M1 独立速度-电流闭环
 #define CONTROL_MODE_MASTER_SLAVE_SPEED  1 // M0 手轮输入，M1 单向调速
-#define CONTROL_MODE CONTROL_MODE_MASTER_SLAVE_SPEED
+#define CONTROL_MODE_BILATERAL_COUPLING  2 // M0/M1 双向位置同步与力反馈
+#define CONTROL_MODE CONTROL_MODE_BILATERAL_COUPLING
 // ======================================================
 
 #define _USE_MATH_DEFINES
@@ -97,10 +98,27 @@ static const char *TAG = "FOC";
 #define ABSOLUTE_MAX_SPEED     30.0f
 #define ABSOLUTE_MAX_IQ        1.0f
 
+// 双向电子轴：位置刚度(A/rad)、速度阻尼(A/(rad/s))和安全限制
+#define LINK_DEFAULT_KP             0.80f
+#define LINK_DEFAULT_KD             0.030f
+#define LINK_DEFAULT_CURRENT_LIMIT  0.15f
+#define LINK_DEFAULT_CURRENT_RAMP   10.0f
+#define LINK_DEFAULT_RATIO          1.0f
+#define LINK_POSITION_ERROR_LIMIT   1.5f
+#define LINK_POSITION_DEADBAND      0.005f
+#define LINK_VELOCITY_DEADBAND      0.05f
+#define LINK_VELOCITY_FILTER_TF     0.005f
+
+// 参考第九章力位闭环，双向模式使用更快的电流环参数。
+#define BILATERAL_CURRENT_KP        1.25f
+#define BILATERAL_CURRENT_KI        50.0f
+
 #if CONTROL_MODE == CONTROL_MODE_DUAL_VELOCITY
 #define CONTROL_MODE_NAME "DUAL_VELOCITY"
 #elif CONTROL_MODE == CONTROL_MODE_MASTER_SLAVE_SPEED
 #define CONTROL_MODE_NAME "MASTER_SLAVE_SPEED"
+#elif CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+#define CONTROL_MODE_NAME "BILATERAL_COUPLING"
 #else
 #error "Invalid CONTROL_MODE"
 #endif
@@ -115,6 +133,13 @@ static float normalizeAngle(float angle) {
     float value = fmodf(angle, 2.0f * M_PI);
     return value >= 0.0f ? value : value + 2.0f * M_PI;
 }
+
+#if CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+static float applySoftDeadband(float value, float deadband) {
+    if (fabsf(value) <= deadband) return 0.0f;
+    return value - copysignf(deadband, value);
+}
+#endif
 
 typedef struct {
     AS5600_t encoder;
@@ -139,6 +164,13 @@ typedef struct {
 } MotorTelemetry_t;
 
 typedef struct {
+    float position;
+    float velocity;
+    float electrical_angle;
+    float iq;
+} MotorSample_t;
+
+typedef struct {
     float p;
     float i;
     float d;
@@ -155,6 +187,16 @@ typedef struct {
     float link_max_speed;
     float link_pending_angle;
     bool master_input_enabled;
+    float link_kp;
+    float link_kd;
+    float link_current_limit;
+    float link_current_ramp;
+    float link_ratio;
+    float link_position_error;
+    float link_velocity_error_raw;
+    float link_velocity_error;
+    float link_iq_request;
+    float link_iq_command;
 } SystemSnapshot_t;
 
 typedef enum {
@@ -164,6 +206,12 @@ typedef enum {
     CMD_SET_RUNNING,
     CMD_SET_LINK_GAIN,
     CMD_SET_LINK_MAX,
+    CMD_SET_LINK_KP,
+    CMD_SET_LINK_KD,
+    CMD_SET_LINK_CURRENT,
+    CMD_SET_LINK_RAMP,
+    CMD_SET_LINK_RATIO,
+    CMD_SET_LINK_PARAMS,
     CMD_ZERO_LINK,
 } CommandType_t;
 
@@ -191,11 +239,41 @@ static float link_max_speed = LINK_DEFAULT_MAX_SPEED;
 static float link_pending_angle = 0.0f;
 static bool master_input_enabled = true;
 
-// 与 Arduino 示例一致：每台电机速度 Tf=10ms，电流 Tf=50ms
+static float bilateral_link_kp = LINK_DEFAULT_KP;
+static float bilateral_link_kd = LINK_DEFAULT_KD;
+static float bilateral_current_limit = LINK_DEFAULT_CURRENT_LIMIT;
+static float bilateral_current_ramp = LINK_DEFAULT_CURRENT_RAMP;
+static float bilateral_ratio = LINK_DEFAULT_RATIO;
+#if CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+static float bilateral_zero_position[2] = {};
+#endif
+static float bilateral_position_error = 0.0f;
+#if CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+static float bilateral_position_error_prev = 0.0f;
+#endif
+static float bilateral_velocity_error_raw = 0.0f;
+static float bilateral_velocity_error = 0.0f;
+static float bilateral_iq_request = 0.0f;
+static float bilateral_iq_command = 0.0f;
+#if CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+static int64_t bilateral_timestamp_prev = 0;
+#endif
+static bool bilateral_zero_pending = false;
+
+// 速度滤波保持 10ms；双向力反馈缩短电流滤波以降低相位滞后。
 static LowPassFilter m0_velocity_filter(0.01f);
+#if CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+static LowPassFilter m0_current_filter(0.01f);
+#else
 static LowPassFilter m0_current_filter(0.05f);
+#endif
 static LowPassFilter m1_velocity_filter(0.01f);
+#if CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+static LowPassFilter m1_current_filter(0.01f);
+static LowPassFilter bilateral_velocity_filter(LINK_VELOCITY_FILTER_TF);
+#else
 static LowPassFilter m1_current_filter(0.05f);
+#endif
 
 static PidParameters_t getPidParameters(const PID_t *pid) {
     PidParameters_t params = {};
@@ -214,46 +292,139 @@ static void initControlState(MotorControl_t *control) {
     control->velocity_timestamp_prev = esp_timer_get_time();
 }
 
-static MotorTelemetry_t updateClosedLoopMotor(MotorControl_t *control,
-                                               LowPassFilter &velocity_filter,
-                                               LowPassFilter &current_filter) {
+static MotorSample_t sampleClosedLoopMotor(MotorControl_t *control,
+                                            LowPassFilter &velocity_filter,
+                                            LowPassFilter &current_filter) {
     float raw_angle = AS5600_getAngle_Without_track(&control->encoder);
     float full_angle = AS5600_trackAngle(&control->encoder, raw_angle);
     int64_t now = esp_timer_get_time();
     float dt = (float)(now - control->velocity_timestamp_prev) * 1e-6f;
     if (dt <= 0.0f || dt > 0.5f) dt = 1e-3f;
 
-    float position = control->motor.DIR * full_angle;
-    float velocity = velocity_filter(
+    MotorSample_t sample = {};
+    sample.position = control->motor.DIR * full_angle;
+    sample.velocity = velocity_filter(
         control->motor.DIR * (full_angle - control->full_angle_prev) / dt);
-    float electrical_angle = normalizeAngle(
+    sample.electrical_angle = normalizeAngle(
         (float)(control->motor.DIR * control->motor.PP) * raw_angle
         - control->motor.zero_electric_angle);
-    float iq = current_filter(CurrSense_getIq(&control->current_sense, electrical_angle));
-    float iq_target = 0.0f;
-    float uq = 0.0f;
-
-    if (control->running) {
-        iq_target = PID_update(
-            &control->velocity_pid,
-            (control->target_velocity - velocity) * DEG_PER_RAD);
-        uq = PID_update(&control->current_pid, iq_target - iq);
-    }
-    Motor_setTorque(&control->motor, uq, electrical_angle);
+    sample.iq = current_filter(
+        CurrSense_getIq(&control->current_sense, sample.electrical_angle));
 
     control->full_angle_prev = full_angle;
     control->velocity_timestamp_prev = now;
+    return sample;
+}
+
+static MotorTelemetry_t applyCurrentTarget(MotorControl_t *control,
+                                            const MotorSample_t *sample,
+                                            float iq_target) {
+    float uq = 0.0f;
+    if (control->running)
+        uq = PID_update(&control->current_pid, iq_target - sample->iq);
+    else
+        iq_target = 0.0f;
+    Motor_setTorque(&control->motor, uq, sample->electrical_angle);
 
     MotorTelemetry_t state = {};
     state.running = control->running;
     state.target_velocity = control->target_velocity;
-    state.position = position;
-    state.velocity = velocity;
+    state.position = sample->position;
+    state.velocity = sample->velocity;
     state.iq_target = iq_target;
-    state.iq = iq;
+    state.iq = sample->iq;
     state.uq = uq;
     return state;
 }
+
+#if CONTROL_MODE != CONTROL_MODE_BILATERAL_COUPLING
+static MotorTelemetry_t updateClosedLoopMotor(MotorControl_t *control,
+                                              LowPassFilter &velocity_filter,
+                                              LowPassFilter &current_filter) {
+    MotorSample_t sample = sampleClosedLoopMotor(
+        control, velocity_filter, current_filter);
+    float iq_target = 0.0f;
+
+    if (control->running)
+        iq_target = PID_update(
+            &control->velocity_pid,
+            (control->target_velocity - sample.velocity) * DEG_PER_RAD);
+    return applyCurrentTarget(control, &sample, iq_target);
+}
+#endif
+
+#if CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+static void updateBilateralCoupling(MotorTelemetry_t state[2]) {
+    MotorSample_t sample[2];
+    sample[0] = sampleClosedLoopMotor(
+        &motor0, m0_velocity_filter, m0_current_filter);
+    sample[1] = sampleClosedLoopMotor(
+        &motor1, m1_velocity_filter, m1_current_filter);
+
+    bool zeroed = bilateral_zero_pending;
+    if (zeroed) {
+        bilateral_zero_position[0] = sample[0].position;
+        bilateral_zero_position[1] = sample[1].position;
+        bilateral_position_error = 0.0f;
+        bilateral_position_error_prev = 0.0f;
+        bilateral_velocity_error_raw = 0.0f;
+        bilateral_velocity_error = 0.0f;
+        bilateral_iq_request = 0.0f;
+        bilateral_iq_command = 0.0f;
+        bilateral_velocity_filter.reset();
+        bilateral_timestamp_prev = esp_timer_get_time();
+        PID_reset(&motor0.current_pid);
+        PID_reset(&motor1.current_pid);
+        bilateral_zero_pending = false;
+    }
+
+    float q0 = sample[0].position - bilateral_zero_position[0];
+    float q1 = sample[1].position - bilateral_zero_position[1];
+    bilateral_position_error = q0 - q1 / bilateral_ratio;
+
+    int64_t now = esp_timer_get_time();
+    float dt = (float)(now - bilateral_timestamp_prev) * 1e-6f;
+    if (dt <= 0.0f || dt > 0.5f) dt = 1e-3f;
+    bilateral_timestamp_prev = now;
+
+    bilateral_velocity_error_raw = zeroed
+        ? 0.0f
+        : (bilateral_position_error - bilateral_position_error_prev) / dt;
+    bilateral_position_error_prev = bilateral_position_error;
+    bilateral_velocity_error = bilateral_velocity_filter(
+        bilateral_velocity_error_raw);
+
+    float limited_error = constrainValue(
+        bilateral_position_error, -LINK_POSITION_ERROR_LIMIT,
+        LINK_POSITION_ERROR_LIMIT);
+    float controlled_error = applySoftDeadband(
+        limited_error, LINK_POSITION_DEADBAND);
+    float controlled_velocity = applySoftDeadband(
+        bilateral_velocity_error, LINK_VELOCITY_DEADBAND);
+    bilateral_iq_request = bilateral_link_kp * controlled_error
+                         + bilateral_link_kd * controlled_velocity;
+    float requested_iq = constrainValue(bilateral_iq_request,
+                                        -bilateral_current_limit,
+                                        bilateral_current_limit);
+
+    if (motor0.running && motor1.running) {
+        float max_step = bilateral_current_ramp * dt;
+        float delta = constrainValue(requested_iq - bilateral_iq_command,
+                                     -max_step, max_step);
+        bilateral_iq_command += delta;
+    } else {
+        bilateral_iq_command = 0.0f;
+    }
+
+    // RATIO=1 时两台相同电机采用大小相同、方向相反的 Iq。
+    float iq_target_m0 = -bilateral_iq_command;
+    float iq_target_m1 = constrainValue(
+        bilateral_iq_command / bilateral_ratio,
+        -bilateral_current_limit, bilateral_current_limit);
+    state[0] = applyCurrentTarget(&motor0, &sample[0], iq_target_m0);
+    state[1] = applyCurrentTarget(&motor1, &sample[1], iq_target_m1);
+}
+#endif
 
 #if CONTROL_MODE == CONTROL_MODE_MASTER_SLAVE_SPEED
 static MotorTelemetry_t updateMasterInput(void) {
@@ -338,6 +509,12 @@ static void applyCommand(const ControlCommand_t *command) {
             }
             if (command->motor_mask & MOTOR_MASK_M1)
                 setMotorRunning(&motor1, command->enabled);
+#elif CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+            // 电子轴必须成对启停，避免只驱动一侧产生意外转矩。
+            setMotorRunning(&motor0, command->enabled);
+            setMotorRunning(&motor1, command->enabled);
+            bilateral_iq_command = 0.0f;
+            bilateral_zero_pending = command->enabled;
 #else
             if (command->motor_mask & MOTOR_MASK_M0)
                 setMotorRunning(&motor0, command->enabled);
@@ -356,11 +533,48 @@ static void applyCommand(const ControlCommand_t *command) {
                 motor1.target_velocity, 0.0f, link_max_speed);
             break;
 
+        case CMD_SET_LINK_KP:
+            bilateral_link_kp = command->value[0];
+            break;
+
+        case CMD_SET_LINK_KD:
+            bilateral_link_kd = command->value[0];
+            break;
+
+        case CMD_SET_LINK_CURRENT:
+            bilateral_current_limit = command->value[0];
+            bilateral_iq_command = constrainValue(
+                bilateral_iq_command, -bilateral_current_limit,
+                bilateral_current_limit);
+            break;
+
+        case CMD_SET_LINK_RAMP:
+            bilateral_current_ramp = command->value[0];
+            break;
+
+        case CMD_SET_LINK_RATIO:
+            bilateral_ratio = command->value[0];
+            bilateral_zero_pending = true;
+            break;
+
+        case CMD_SET_LINK_PARAMS:
+            bilateral_link_kp = command->value[0];
+            bilateral_link_kd = command->value[1];
+            bilateral_current_limit = command->value[2];
+            bilateral_ratio = command->value[3];
+            bilateral_iq_command = 0.0f;
+            bilateral_zero_pending = true;
+            break;
+
         case CMD_ZERO_LINK:
+#if CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+            bilateral_zero_pending = true;
+#else
             link_pending_angle = 0.0f;
             motor1.target_velocity = 0.0f;
             PID_reset(&motor1.velocity_pid);
             PID_reset(&motor1.current_pid);
+#endif
             break;
     }
 }
@@ -378,6 +592,16 @@ static void updateSnapshot(const MotorTelemetry_t state[2], float current_hz) {
     snapshot.link_max_speed = link_max_speed;
     snapshot.link_pending_angle = link_pending_angle;
     snapshot.master_input_enabled = master_input_enabled;
+    snapshot.link_kp = bilateral_link_kp;
+    snapshot.link_kd = bilateral_link_kd;
+    snapshot.link_current_limit = bilateral_current_limit;
+    snapshot.link_current_ramp = bilateral_current_ramp;
+    snapshot.link_ratio = bilateral_ratio;
+    snapshot.link_position_error = bilateral_position_error;
+    snapshot.link_velocity_error_raw = bilateral_velocity_error_raw;
+    snapshot.link_velocity_error = bilateral_velocity_error;
+    snapshot.link_iq_request = bilateral_iq_request;
+    snapshot.link_iq_command = bilateral_iq_command;
     xSemaphoreGive(snapshot_mutex);
 }
 
@@ -402,6 +626,8 @@ static void control_task(void *arg) {
         state[0] = updateMasterInput();
         state[1] = updateClosedLoopMotor(
             &motor1, m1_velocity_filter, m1_current_filter);
+#elif CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+        updateBilateralCoupling(state);
 #else
         state[0] = updateClosedLoopMotor(
             &motor0, m0_velocity_filter, m0_current_filter);
@@ -519,7 +745,9 @@ static void sendHelp(bool uart_output) {
     sendResponse(uart_output, "SET M0|M1 VEL value");
     sendResponse(uart_output, "SET ALL VEL m0_value m1_value");
     sendResponse(uart_output, "SET M0|M1|ALL VPID|CPID P I D RAMP LIMIT");
-    sendResponse(uart_output, "SET LINK GAIN value | SET LINK MAX value | ZERO LINK");
+    sendResponse(uart_output, "SET LINK GAIN|MAX value (master/slave)");
+    sendResponse(uart_output, "SET LINK KP|KD|CURRENT|RAMP|RATIO value (bilateral)");
+    sendResponse(uart_output, "SET LINK PARAM kp kd current ratio | ZERO LINK");
     sendResponse(uart_output, "GET M0|M1|ALL STATE|PARAM | GET MODE | GET LINK");
     sendResponse(uart_output, "LOG 1..100 | LOG OFF | HELP");
 }
@@ -580,9 +808,19 @@ static void processCommand(char *line, bool uart_output) {
             return;
         }
         if (count == 2 && tokenEquals(token[1], "LINK")) {
+#if CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+            sendResponse(uart_output,
+                         "LINK KP=%.4f KD=%.4f CURRENT=%.3f RAMP=%.3f RATIO=%.3f E=%.4f DE_RAW=%.3f DE=%.3f IQ_REQ=%.3f IQ=%.3f",
+                         state.link_kp, state.link_kd, state.link_current_limit,
+                         state.link_current_ramp, state.link_ratio,
+                         state.link_position_error, state.link_velocity_error_raw,
+                         state.link_velocity_error, state.link_iq_request,
+                         state.link_iq_command);
+#else
             sendResponse(uart_output, "LINK GAIN=%.3f MAX=%.3f TARGET=%.3f PENDING=%.4f",
                          state.link_gain, state.link_max_speed,
                          state.motor[1].target_velocity, state.link_pending_angle);
+#endif
             return;
         }
         if (count == 3) {
@@ -607,21 +845,54 @@ static void processCommand(char *line, bool uart_output) {
     }
 
     if (tokenEquals(token[0], "SET")) {
+        if (count == 7 && tokenEquals(token[1], "LINK")
+            && tokenEquals(token[2], "PARAM")) {
+            ControlCommand_t command = {};
+            command.type = CMD_SET_LINK_PARAMS;
+            for (int i = 0; i < 4; i++) {
+                if (!parseFloat(token[3 + i], &command.value[i])) {
+                    sendResponse(uart_output, "ERR BAD_VALUE");
+                    return;
+                }
+            }
+            if (command.value[0] < 0.0f || command.value[0] > 10.0f
+                || command.value[1] < 0.0f || command.value[1] > 1.0f
+                || command.value[2] <= 0.0f || command.value[2] > ABSOLUTE_MAX_IQ
+                || fabsf(command.value[3]) < 0.1f || fabsf(command.value[3]) > 10.0f) {
+                sendResponse(uart_output, "ERR BAD_VALUE");
+                return;
+            }
+            if (enqueueCommand(&command, uart_output))
+                sendResponse(uart_output, "OK SET LINK PARAM");
+            return;
+        }
+
         if (count == 4 && tokenEquals(token[1], "LINK")) {
             float value;
-            if (!parseFloat(token[3], &value) || value <= 0.0f
-                || (tokenEquals(token[2], "MAX") && value > ABSOLUTE_MAX_SPEED)
-                || (tokenEquals(token[2], "GAIN") && value > 100.0f)) {
+            if (!parseFloat(token[3], &value)) {
                 sendResponse(uart_output, "ERR BAD_VALUE");
                 return;
             }
             ControlCommand_t command = {};
-            if (tokenEquals(token[2], "GAIN"))
+            if (tokenEquals(token[2], "GAIN") && value > 0.0f && value <= 100.0f)
                 command.type = CMD_SET_LINK_GAIN;
-            else if (tokenEquals(token[2], "MAX"))
+            else if (tokenEquals(token[2], "MAX") && value > 0.0f
+                     && value <= ABSOLUTE_MAX_SPEED)
                 command.type = CMD_SET_LINK_MAX;
+            else if (tokenEquals(token[2], "KP") && value >= 0.0f && value <= 10.0f)
+                command.type = CMD_SET_LINK_KP;
+            else if (tokenEquals(token[2], "KD") && value >= 0.0f && value <= 1.0f)
+                command.type = CMD_SET_LINK_KD;
+            else if (tokenEquals(token[2], "CURRENT") && value > 0.0f
+                     && value <= ABSOLUTE_MAX_IQ)
+                command.type = CMD_SET_LINK_CURRENT;
+            else if (tokenEquals(token[2], "RAMP") && value > 0.0f && value <= 100.0f)
+                command.type = CMD_SET_LINK_RAMP;
+            else if (tokenEquals(token[2], "RATIO") && fabsf(value) >= 0.1f
+                     && fabsf(value) <= 10.0f)
+                command.type = CMD_SET_LINK_RATIO;
             else {
-                sendResponse(uart_output, "ERR BAD_COMMAND");
+                sendResponse(uart_output, "ERR BAD_VALUE");
                 return;
             }
             command.value[0] = value;
@@ -648,6 +919,9 @@ static void processCommand(char *line, bool uart_output) {
                     sendResponse(uart_output, "ERR M0_INPUT_ONLY");
                     return;
                 }
+#elif CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+                sendResponse(uart_output, "ERR LINK_MODE_ONLY");
+                return;
 #endif
                 ControlCommand_t command = {};
                 command.type = CMD_SET_VELOCITY;
@@ -776,6 +1050,14 @@ static void telemetry_task(void *arg) {
                  state.motor[0].velocity, state.motor[0].position,
                  state.motor[1].target_velocity);
         outputTelemetryLine(line);
+#elif CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+        snprintf(line, sizeof(line),
+                 "TEL LINK E=%.4f DE_RAW=%.3f DE=%.3f IQ_REQ=%.3f IQ=%.3f KP=%.3f KD=%.4f LIMIT=%.3f",
+                 state.link_position_error, state.link_velocity_error_raw,
+                 state.link_velocity_error, state.link_iq_request,
+                 state.link_iq_command, state.link_kp, state.link_kd,
+                 state.link_current_limit);
+        outputTelemetryLine(line);
 #endif
         snprintf(line, sizeof(line),
                  "TEL M1 %s VEL_T=%.3f VEL=%.3f POS=%.3f IQ_T=%.3f IQ=%.3f UQ=%.3f HZ=%.0f",
@@ -784,7 +1066,8 @@ static void telemetry_task(void *arg) {
                  state.motor[1].position, state.motor[1].iq_target,
                  state.motor[1].iq, state.motor[1].uq, state.control_hz);
         outputTelemetryLine(line);
-#if CONTROL_MODE == CONTROL_MODE_DUAL_VELOCITY
+#if CONTROL_MODE == CONTROL_MODE_DUAL_VELOCITY \
+    || CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
         snprintf(line, sizeof(line),
                  "TEL M0 %s VEL_T=%.3f VEL=%.3f POS=%.3f IQ_T=%.3f IQ=%.3f UQ=%.3f",
                  state.motor[0].running ? "RUN" : "STOP",
@@ -815,8 +1098,13 @@ static void initUart(void) {
 static void initPid(MotorControl_t *control) {
     PID_init(&control->velocity_pid, VELOCITY_KP, VELOCITY_KI, VELOCITY_KD,
              VELOCITY_RAMP, VELOCITY_LIMIT);
+#if CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+    PID_init(&control->current_pid, BILATERAL_CURRENT_KP,
+             BILATERAL_CURRENT_KI, CURRENT_KD, CURRENT_RAMP, CURRENT_LIMIT);
+#else
     PID_init(&control->current_pid, CURRENT_KP, CURRENT_KI, CURRENT_KD,
              CURRENT_RAMP, CURRENT_LIMIT);
+#endif
 }
 
 extern "C" void app_main(void) {
@@ -875,10 +1163,20 @@ extern "C" void app_main(void) {
     Motor_alignSensor(&motor0.motor, MOTOR_POLE_PAIRS, M0_SENSOR_DIRECTION);
     Motor_alignSensor(&motor1.motor, MOTOR_POLE_PAIRS, M1_SENSOR_DIRECTION);
 
+#if CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+    // 双向力反馈默认不输出；RUN 时以当时位置建立同步零点。
+    motor0.target_velocity = 0.0f;
+    motor1.target_velocity = 0.0f;
+    motor0.running = false;
+    motor1.running = false;
+    bilateral_zero_pending = true;
+    bilateral_timestamp_prev = esp_timer_get_time();
+#else
     motor0.target_velocity = M0_DEFAULT_VELOCITY;
     motor1.target_velocity = M1_DEFAULT_VELOCITY;
     motor0.running = true;
     motor1.running = true;
+#endif
 #endif
 
     initPid(&motor0);

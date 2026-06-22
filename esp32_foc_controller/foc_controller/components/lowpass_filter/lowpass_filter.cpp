@@ -12,6 +12,12 @@ LowPassFilter::LowPassFilter(float time_constant)
     timestamp_prev = esp_timer_get_time();
 }
 
+void LowPassFilter::reset(float value)
+{
+    y_prev = value;
+    timestamp_prev = esp_timer_get_time();
+}
+
 float LowPassFilter::operator()(float x)
 {
     int64_t timestamp = esp_timer_get_time();
