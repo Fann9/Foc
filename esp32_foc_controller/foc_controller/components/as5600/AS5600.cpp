@@ -1,5 +1,5 @@
-// 灯哥开源，遵循GNU协议，转载请著名版权！
-// 基于原版代码移植到 ESP-IDF 原生 API
+// AS5600 磁编码器驱动 — 实例化版本
+// 每个 AS5600_t 结构体对应一个物理编码器，支持多编码器并存
 
 #define _USE_MATH_DEFINES
 #include <math.h>
@@ -22,28 +22,31 @@ static const char *TAG = "AS5600";
 #define AS5600_RAW_ANG_HI  0x0C
 #define AS5600_RAW_ANG_LO  0x0D
 
-#define I2C_SDA_PIN  19
-#define I2C_SCL_PIN  18
-#define I2C_FREQ_HZ  400000
+// 初始化 AS5600：配置 I2C 总线并安装驱动
+void AS5600_init(AS5600_t *dev, i2c_port_t port, int sda, int scl, uint32_t freq) {
+    dev->i2c_port = port;
+    dev->sda_pin = sda;
+    dev->scl_pin = scl;
+    dev->freq_hz = freq;
+    dev->full_rotations = 0;
+    dev->angle_prev = 0;
 
-static int32_t full_rotations = 0;
-static float angle_prev = 0;
-
-void BeginSensor() {
     i2c_config_t conf;
     memset(&conf, 0, sizeof(conf));
     conf.mode = I2C_MODE_MASTER;
-    conf.sda_io_num = (gpio_num_t)I2C_SDA_PIN;
-    conf.scl_io_num = (gpio_num_t)I2C_SCL_PIN;
+    conf.sda_io_num = (gpio_num_t)sda;
+    conf.scl_io_num = (gpio_num_t)scl;
     conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
     conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.master.clk_speed = I2C_FREQ_HZ;
-    ESP_ERROR_CHECK(i2c_param_config(I2C_NUM_0, &conf));
-    ESP_ERROR_CHECK(i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0));
-    ESP_LOGI(TAG, "AS5600 initialized (SDA=%d, SCL=%d, %dkHz)", I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQ_HZ / 1000);
+    conf.master.clk_speed = freq;
+    ESP_ERROR_CHECK(i2c_param_config(port, &conf));
+    ESP_ERROR_CHECK(i2c_driver_install(port, I2C_MODE_MASTER, 0, 0, 0));
+    ESP_LOGI(TAG, "AS5600 initialized (port=%d, SDA=%d, SCL=%d, %dkHz)",
+             port, sda, scl, freq / 1000);
 }
 
-static uint16_t readTwoBytes(uint8_t reg_hi, uint8_t reg_lo) {
+// 通过 I2C 读取两个寄存器字节并合并为 16 位值
+static uint16_t readTwoBytes(AS5600_t *dev, uint8_t reg_hi, uint8_t reg_lo) {
     uint8_t buf[2];
 
     // 读高位寄存器
@@ -55,7 +58,7 @@ static uint16_t readTwoBytes(uint8_t reg_hi, uint8_t reg_lo) {
     i2c_master_write_byte(cmd, (AS5600_ADDR << 1) | I2C_MASTER_READ, true);
     i2c_master_read(cmd, &buf[1], 1, I2C_MASTER_LAST_NACK);
     i2c_master_stop(cmd);
-    i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(100));
+    i2c_master_cmd_begin(dev->i2c_port, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
 
     // 读低位寄存器
@@ -67,26 +70,29 @@ static uint16_t readTwoBytes(uint8_t reg_hi, uint8_t reg_lo) {
     i2c_master_write_byte(cmd, (AS5600_ADDR << 1) | I2C_MASTER_READ, true);
     i2c_master_read(cmd, &buf[0], 1, I2C_MASTER_LAST_NACK);
     i2c_master_stop(cmd);
-    i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(100));
+    i2c_master_cmd_begin(dev->i2c_port, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
 
     return (buf[1] << 8) | buf[0];
 }
 
-uint16_t getRawAngle() {
-    return readTwoBytes(AS5600_RAW_ANG_HI, AS5600_RAW_ANG_LO);
+// 读取原始角度 (0-4095, 12 位分辨率)
+uint16_t AS5600_getRawAngle(AS5600_t *dev) {
+    return readTwoBytes(dev, AS5600_RAW_ANG_HI, AS5600_RAW_ANG_LO);
 }
 
-float getAngle_Without_track() {
-    return getRawAngle() * 0.08789f * M_PI / 180.0f;
+// 转换为单圈弧度 (0 ~ 2PI)
+float AS5600_getAngle_Without_track(AS5600_t *dev) {
+    return AS5600_getRawAngle(dev) * 0.08789f * M_PI / 180.0f;
 }
 
-float getAngle() {
-    float val = getAngle_Without_track();
-    float d_angle = val - angle_prev;
+// 多圈角度追踪：检测过零点并累计圈数
+float AS5600_getAngle(AS5600_t *dev) {
+    float val = AS5600_getAngle_Without_track(dev);
+    float d_angle = val - dev->angle_prev;
     if (fabsf(d_angle) > (0.8f * 6.28318530718f)) {
-        full_rotations += (d_angle > 0) ? -1 : 1;
+        dev->full_rotations += (d_angle > 0) ? -1 : 1;
     }
-    angle_prev = val;
-    return (float)full_rotations * 6.28318530718f + angle_prev;
+    dev->angle_prev = val;
+    return (float)dev->full_rotations * 6.28318530718f + dev->angle_prev;
 }
