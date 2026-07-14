@@ -29,7 +29,7 @@
 
 static const char *TAG = "FOC";
 
-#define MOTOR_ENABLE_PIN  35
+#define MOTOR_ENABLE_PIN  12
 
 // UART 配置 (IO16=ESP_TX, IO17=ESP_RX)
 #define UART_PORT       UART_NUM_1
@@ -274,10 +274,10 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Motor driver enabled (GPIO %d)", MOTOR_ENABLE_PIN);
 
     // 初始化编码器 (I2C, SDA=19, SCL=18, 400kHz)
-    AS5600_init(&encoder, I2C_NUM_0, 15, 14, 400000);
+    AS5600_init(&encoder, I2C_NUM_0, 19, 18, 400000);
 
     // 初始化电机 (12.3V, PWM: 32/33/25)
-    Motor_init(&motor, 12.3f, 1, 2, 5, &encoder);
+    Motor_init(&motor, 12.3f, 32, 33, 25, &encoder);
 
     // 电角度校准：极对数 7，方向 -1
     Motor_alignSensor(&motor, 7, -1);
