@@ -7,7 +7,8 @@
 #define CONTROL_MODE_DUAL_VELOCITY       0 // M0/M1 独立速度-电流闭环
 #define CONTROL_MODE_MASTER_SLAVE_SPEED  1 // M0 手轮输入，M1 单向调速
 #define CONTROL_MODE_BILATERAL_COUPLING  2 // M0/M1 双向位置同步与力反馈
-#define CONTROL_MODE CONTROL_MODE_BILATERAL_COUPLING
+#define CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD 3 // M0易堵停，M1增流抗负载
+#define CONTROL_MODE CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
 // ======================================================
 
 #define _USE_MATH_DEFINES
@@ -113,12 +114,36 @@ static const char *TAG = "FOC";
 #define BILATERAL_CURRENT_KP        1.25f
 #define BILATERAL_CURRENT_KI        50.0f
 
+// 独立负载模式：速度 PI 输出 Iq 目标，电流 PI 输出 Uq。
+#define LOAD_DEFAULT_VELOCITY       (16.0f * M_PI)
+#define LOAD_MAX_VELOCITY           80.0f
+#define LOAD_VELOCITY_KP            0.03f
+#define LOAD_VELOCITY_KI            0.20f
+#define LOAD_VELOCITY_RAMP          5.0f
+#define M0_NORMAL_IQ_LIMIT          0.12f
+#define M0_SOFT_STOP_IQ             0.02f
+#define M0_ARM_SPEED_RATIO          0.80f
+#define M0_LOAD_SPEED_RATIO         0.70f
+#define M0_STALL_SPEED_RATIO        0.20f
+#define M0_RELEASE_SPEED_RATIO      0.05f
+#define M0_TRIP_CURRENT             0.08f
+#define M0_ARM_CONFIRM_CYCLES       200
+#define M0_TRIP_CONFIRM_CYCLES      30
+#define M0_RELEASE_CONFIRM_CYCLES   100
+#define M0_RECOVER_TIMEOUT_CYCLES   500
+#define M1_IQ_LIMIT                 0.50f
+#define M1_OVERCURRENT_LIMIT        1.0f
+#define M1_OVERCURRENT_CYCLES       50
+#define M1_FAULT_COOLDOWN_CYCLES    1000
+
 #if CONTROL_MODE == CONTROL_MODE_DUAL_VELOCITY
 #define CONTROL_MODE_NAME "DUAL_VELOCITY"
 #elif CONTROL_MODE == CONTROL_MODE_MASTER_SLAVE_SPEED
 #define CONTROL_MODE_NAME "MASTER_SLAVE_SPEED"
 #elif CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
 #define CONTROL_MODE_NAME "BILATERAL_COUPLING"
+#elif CONTROL_MODE == CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
+#define CONTROL_MODE_NAME "INDEPENDENT_VOLTAGE_LOAD"
 #else
 #error "Invalid CONTROL_MODE"
 #endif
@@ -197,7 +222,21 @@ typedef struct {
     float link_velocity_error;
     float link_iq_request;
     float link_iq_command;
+    uint8_t m0_load_state;
+    uint8_t m1_load_state;
 } SystemSnapshot_t;
+
+typedef enum {
+    M0_LOAD_STARTING,
+    M0_LOAD_ARMED,
+    M0_LOAD_SOFT_STOP,
+    M0_LOAD_RECOVERING,
+} M0LoadState_t;
+
+typedef enum {
+    M1_LOAD_DRIVE,
+    M1_LOAD_OVERCURRENT,
+} M1LoadState_t;
 
 typedef enum {
     CMD_SET_VELOCITY,
@@ -260,17 +299,30 @@ static int64_t bilateral_timestamp_prev = 0;
 #endif
 static bool bilateral_zero_pending = false;
 
+static M0LoadState_t m0_load_state = M0_LOAD_STARTING;
+static M1LoadState_t m1_load_state = M1_LOAD_DRIVE;
+#if CONTROL_MODE == CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
+static uint32_t m0_load_counter = 0;
+static uint32_t m0_recover_counter = 0;
+static uint32_t m1_overcurrent_counter = 0;
+static uint32_t m1_fault_counter = 0;
+#endif
+
 // 速度滤波保持 10ms；双向力反馈缩短电流滤波以降低相位滞后。
 static LowPassFilter m0_velocity_filter(0.01f);
-#if CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+#if CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING \
+    || CONTROL_MODE == CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
 static LowPassFilter m0_current_filter(0.01f);
 #else
 static LowPassFilter m0_current_filter(0.05f);
 #endif
 static LowPassFilter m1_velocity_filter(0.01f);
-#if CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+#if CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING \
+    || CONTROL_MODE == CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
 static LowPassFilter m1_current_filter(0.01f);
+#if CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
 static LowPassFilter bilateral_velocity_filter(LINK_VELOCITY_FILTER_TF);
+#endif
 #else
 static LowPassFilter m1_current_filter(0.05f);
 #endif
@@ -337,7 +389,8 @@ static MotorTelemetry_t applyCurrentTarget(MotorControl_t *control,
     return state;
 }
 
-#if CONTROL_MODE != CONTROL_MODE_BILATERAL_COUPLING
+#if CONTROL_MODE == CONTROL_MODE_DUAL_VELOCITY \
+    || CONTROL_MODE == CONTROL_MODE_MASTER_SLAVE_SPEED
 static MotorTelemetry_t updateClosedLoopMotor(MotorControl_t *control,
                                               LowPassFilter &velocity_filter,
                                               LowPassFilter &current_filter) {
@@ -426,6 +479,144 @@ static void updateBilateralCoupling(MotorTelemetry_t state[2]) {
 }
 #endif
 
+#if CONTROL_MODE == CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
+static float updateLoadSpeedPid(MotorControl_t *control,
+                                const MotorSample_t *sample) {
+    if (!control->running) return 0.0f;
+    // 本模式的速度 PI 直接使用 rad/s 误差，输出单位为 A。
+    return PID_update(&control->velocity_pid,
+                      control->target_velocity - sample->velocity);
+}
+
+static void resetM0LoadState(void) {
+    m0_load_state = M0_LOAD_STARTING;
+    m0_load_counter = 0;
+    m0_recover_counter = 0;
+    PID_reset(&motor0.velocity_pid);
+    PID_reset(&motor0.current_pid);
+}
+
+static void updateIndependentVoltageLoad(MotorTelemetry_t state[2]) {
+    MotorSample_t sample[2];
+    sample[0] = sampleClosedLoopMotor(
+        &motor0, m0_velocity_filter, m0_current_filter);
+    sample[1] = sampleClosedLoopMotor(
+        &motor1, m1_velocity_filter, m1_current_filter);
+
+    float m0_target_abs = fabsf(motor0.target_velocity);
+    float m0_speed_abs = fabsf(sample[0].velocity);
+    float m0_iq_target = 0.0f;
+
+    if (!motor0.running || m0_target_abs < 0.01f) {
+        resetM0LoadState();
+    } else {
+        switch (m0_load_state) {
+            case M0_LOAD_STARTING:
+                m0_iq_target = updateLoadSpeedPid(&motor0, &sample[0]);
+                if (m0_speed_abs >= m0_target_abs * M0_ARM_SPEED_RATIO)
+                    m0_load_counter++;
+                else
+                    m0_load_counter = 0;
+                if (m0_load_counter >= M0_ARM_CONFIRM_CYCLES) {
+                    m0_load_state = M0_LOAD_ARMED;
+                    m0_load_counter = 0;
+                }
+                break;
+
+            case M0_LOAD_ARMED:
+                m0_iq_target = updateLoadSpeedPid(&motor0, &sample[0]);
+                if ((m0_speed_abs <= m0_target_abs * M0_LOAD_SPEED_RATIO
+                     && fabsf(sample[0].iq) >= M0_TRIP_CURRENT)
+                    || m0_speed_abs <= m0_target_abs * M0_STALL_SPEED_RATIO)
+                    m0_load_counter++;
+                else
+                    m0_load_counter = 0;
+                if (m0_load_counter >= M0_TRIP_CONFIRM_CYCLES) {
+                    m0_load_state = M0_LOAD_SOFT_STOP;
+                    m0_load_counter = 0;
+                    PID_reset(&motor0.velocity_pid);
+                    PID_reset(&motor0.current_pid);
+                    m0_iq_target = copysignf(M0_SOFT_STOP_IQ,
+                                             motor0.target_velocity);
+                }
+                break;
+
+            case M0_LOAD_SOFT_STOP:
+                m0_iq_target = copysignf(M0_SOFT_STOP_IQ,
+                                         motor0.target_velocity);
+                if (m0_speed_abs >= m0_target_abs * M0_RELEASE_SPEED_RATIO)
+                    m0_load_counter++;
+                else
+                    m0_load_counter = 0;
+                if (m0_load_counter >= M0_RELEASE_CONFIRM_CYCLES) {
+                    m0_load_state = M0_LOAD_RECOVERING;
+                    m0_load_counter = 0;
+                    m0_recover_counter = 0;
+                    PID_reset(&motor0.velocity_pid);
+                    PID_reset(&motor0.current_pid);
+                }
+                break;
+
+            case M0_LOAD_RECOVERING:
+                m0_iq_target = updateLoadSpeedPid(&motor0, &sample[0]);
+                m0_recover_counter++;
+                if (m0_speed_abs >= m0_target_abs * M0_ARM_SPEED_RATIO) {
+                    m0_load_counter++;
+                    if (m0_load_counter >= M0_ARM_CONFIRM_CYCLES) {
+                        m0_load_state = M0_LOAD_ARMED;
+                        m0_load_counter = 0;
+                        m0_recover_counter = 0;
+                    }
+                } else {
+                    m0_load_counter = 0;
+                }
+                if (m0_recover_counter >= M0_RECOVER_TIMEOUT_CYCLES
+                    && m0_speed_abs <= m0_target_abs * M0_RELEASE_SPEED_RATIO) {
+                    m0_load_state = M0_LOAD_SOFT_STOP;
+                    m0_load_counter = 0;
+                    m0_recover_counter = 0;
+                    PID_reset(&motor0.velocity_pid);
+                    PID_reset(&motor0.current_pid);
+                }
+                break;
+        }
+    }
+
+    float m1_iq_target = 0.0f;
+    if (!motor1.running) {
+        m1_load_state = M1_LOAD_DRIVE;
+        m1_overcurrent_counter = 0;
+        m1_fault_counter = 0;
+    } else if (m1_load_state == M1_LOAD_OVERCURRENT) {
+        m1_fault_counter++;
+        if (m1_fault_counter >= M1_FAULT_COOLDOWN_CYCLES) {
+            m1_load_state = M1_LOAD_DRIVE;
+            m1_overcurrent_counter = 0;
+            m1_fault_counter = 0;
+            PID_reset(&motor1.velocity_pid);
+            PID_reset(&motor1.current_pid);
+        }
+    } else {
+        m1_iq_target = updateLoadSpeedPid(&motor1, &sample[1]);
+        if (fabsf(sample[1].iq) >= M1_OVERCURRENT_LIMIT)
+            m1_overcurrent_counter++;
+        else
+            m1_overcurrent_counter = 0;
+        if (m1_overcurrent_counter >= M1_OVERCURRENT_CYCLES) {
+            m1_load_state = M1_LOAD_OVERCURRENT;
+            m1_overcurrent_counter = 0;
+            m1_fault_counter = 0;
+            PID_reset(&motor1.velocity_pid);
+            PID_reset(&motor1.current_pid);
+            m1_iq_target = 0.0f;
+        }
+    }
+
+    state[0] = applyCurrentTarget(&motor0, &sample[0], m0_iq_target);
+    state[1] = applyCurrentTarget(&motor1, &sample[1], m1_iq_target);
+}
+#endif
+
 #if CONTROL_MODE == CONTROL_MODE_MASTER_SLAVE_SPEED
 static MotorTelemetry_t updateMasterInput(void) {
     float raw_angle = AS5600_getAngle_Without_track(&motor0.encoder);
@@ -485,6 +676,17 @@ static void applyCommand(const ControlCommand_t *command) {
 #endif
                 motor1.target_velocity = target;
             }
+#if CONTROL_MODE == CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
+            if (command->motor_mask & MOTOR_MASK_M0)
+                resetM0LoadState();
+            if (command->motor_mask & MOTOR_MASK_M1) {
+                m1_load_state = M1_LOAD_DRIVE;
+                m1_overcurrent_counter = 0;
+                m1_fault_counter = 0;
+                PID_reset(&motor1.velocity_pid);
+                PID_reset(&motor1.current_pid);
+            }
+#endif
             break;
 
         case CMD_SET_VELOCITY_PID:
@@ -515,6 +717,21 @@ static void applyCommand(const ControlCommand_t *command) {
             setMotorRunning(&motor1, command->enabled);
             bilateral_iq_command = 0.0f;
             bilateral_zero_pending = command->enabled;
+#elif CONTROL_MODE == CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
+            if (command->motor_mask & MOTOR_MASK_M0) {
+                if (command->enabled && fabsf(motor0.target_velocity) < 0.01f)
+                    motor0.target_velocity = LOAD_DEFAULT_VELOCITY;
+                setMotorRunning(&motor0, command->enabled);
+                resetM0LoadState();
+            }
+            if (command->motor_mask & MOTOR_MASK_M1) {
+                if (command->enabled && fabsf(motor1.target_velocity) < 0.01f)
+                    motor1.target_velocity = LOAD_DEFAULT_VELOCITY;
+                setMotorRunning(&motor1, command->enabled);
+                m1_load_state = M1_LOAD_DRIVE;
+                m1_overcurrent_counter = 0;
+                m1_fault_counter = 0;
+            }
 #else
             if (command->motor_mask & MOTOR_MASK_M0)
                 setMotorRunning(&motor0, command->enabled);
@@ -602,6 +819,8 @@ static void updateSnapshot(const MotorTelemetry_t state[2], float current_hz) {
     snapshot.link_velocity_error = bilateral_velocity_error;
     snapshot.link_iq_request = bilateral_iq_request;
     snapshot.link_iq_command = bilateral_iq_command;
+    snapshot.m0_load_state = (uint8_t)m0_load_state;
+    snapshot.m1_load_state = (uint8_t)m1_load_state;
     xSemaphoreGive(snapshot_mutex);
 }
 
@@ -628,6 +847,8 @@ static void control_task(void *arg) {
             &motor1, m1_velocity_filter, m1_current_filter);
 #elif CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
         updateBilateralCoupling(state);
+#elif CONTROL_MODE == CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
+        updateIndependentVoltageLoad(state);
 #else
         state[0] = updateClosedLoopMotor(
             &motor0, m0_velocity_filter, m0_current_filter);
@@ -717,11 +938,32 @@ static SystemSnapshot_t readSnapshot(void) {
     return value;
 }
 
+#if CONTROL_MODE == CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
+static const char *m0LoadStateName(uint8_t state) {
+    switch ((M0LoadState_t)state) {
+        case M0_LOAD_STARTING: return "STARTING";
+        case M0_LOAD_ARMED: return "ARMED";
+        case M0_LOAD_SOFT_STOP: return "SOFT_STOP";
+        case M0_LOAD_RECOVERING: return "RECOVERING";
+        default: return "UNKNOWN";
+    }
+}
+
+static const char *m1LoadStateName(uint8_t state) {
+    return state == M1_LOAD_OVERCURRENT ? "OVERCURRENT" : "DRIVE";
+}
+#endif
+
 static void sendState(bool uart_output, int motor_index, const SystemSnapshot_t *state) {
     const MotorTelemetry_t *motor = &state->motor[motor_index];
     const char *run_state = motor->running ? "RUN" : "STOP";
 #if CONTROL_MODE == CONTROL_MODE_MASTER_SLAVE_SPEED
     if (motor_index == 0) run_state = motor->running ? "INPUT" : "PAUSE";
+#elif CONTROL_MODE == CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
+    if (motor->running)
+        run_state = motor_index == 0
+            ? m0LoadStateName(state->m0_load_state)
+            : m1LoadStateName(state->m1_load_state);
 #endif
     sendResponse(uart_output,
                  "STATE M%d %s VEL_T=%.3f VEL=%.3f POS=%.3f IQ_T=%.3f IQ=%.3f UQ=%.3f",
@@ -748,6 +990,7 @@ static void sendHelp(bool uart_output) {
     sendResponse(uart_output, "SET LINK GAIN|MAX value (master/slave)");
     sendResponse(uart_output, "SET LINK KP|KD|CURRENT|RAMP|RATIO value (bilateral)");
     sendResponse(uart_output, "SET LINK PARAM kp kd current ratio | ZERO LINK");
+    sendResponse(uart_output, "GET LOAD (independent voltage/load mode)");
     sendResponse(uart_output, "GET M0|M1|ALL STATE|PARAM | GET MODE | GET LINK");
     sendResponse(uart_output, "LOG 1..100 | LOG OFF | HELP");
 }
@@ -820,6 +1063,22 @@ static void processCommand(char *line, bool uart_output) {
             sendResponse(uart_output, "LINK GAIN=%.3f MAX=%.3f TARGET=%.3f PENDING=%.4f",
                          state.link_gain, state.link_max_speed,
                          state.motor[1].target_velocity, state.link_pending_angle);
+#endif
+            return;
+        }
+        if (count == 2 && tokenEquals(token[1], "LOAD")) {
+#if CONTROL_MODE == CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
+            sendResponse(uart_output,
+                         "LOAD M0=%s TARGET=%.3f LOAD_VEL=%.3f TRIP_IQ=%.2fA HOLD=%.2fA M1=%s TARGET=%.3f IQ_MAX=%.2fA OC=%.2fA",
+                         m0LoadStateName(state.m0_load_state),
+                         state.motor[0].target_velocity,
+                         fabsf(state.motor[0].target_velocity) * M0_LOAD_SPEED_RATIO,
+                         M0_TRIP_CURRENT, M0_SOFT_STOP_IQ,
+                         m1LoadStateName(state.m1_load_state),
+                         state.motor[1].target_velocity, M1_IQ_LIMIT,
+                         M1_OVERCURRENT_LIMIT);
+#else
+            sendResponse(uart_output, "ERR LOAD_MODE_ONLY");
 #endif
             return;
         }
@@ -932,7 +1191,12 @@ static void processCommand(char *line, bool uart_output) {
                         sendResponse(uart_output, "ERR BAD_VALUE");
                         return;
                     }
-#if CONTROL_MODE == CONTROL_MODE_DUAL_VELOCITY
+#if CONTROL_MODE == CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
+                    if (fabsf(command.value[i]) > LOAD_MAX_VELOCITY) {
+                        sendResponse(uart_output, "ERR BAD_VALUE");
+                        return;
+                    }
+#elif CONTROL_MODE == CONTROL_MODE_DUAL_VELOCITY
                     if (fabsf(command.value[i]) > ABSOLUTE_MAX_SPEED) {
                         sendResponse(uart_output, "ERR BAD_VALUE");
                         return;
@@ -963,8 +1227,15 @@ static void processCommand(char *line, bool uart_output) {
                     sendResponse(uart_output, "ERR BAD_VALUE");
                     return;
                 }
+#if CONTROL_MODE == CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
+                float velocity_limit_max = (motor_mask & MOTOR_MASK_M0)
+                    ? M0_NORMAL_IQ_LIMIT : M1_IQ_LIMIT;
+                if (command.type == CMD_SET_VELOCITY_PID
+                    && command.value[4] > velocity_limit_max) {
+#else
                 if (command.type == CMD_SET_VELOCITY_PID
                     && command.value[4] > ABSOLUTE_MAX_IQ) {
+#endif
                     sendResponse(uart_output, "ERR BAD_VALUE");
                     return;
                 }
@@ -1058,6 +1329,12 @@ static void telemetry_task(void *arg) {
                  state.link_iq_command, state.link_kp, state.link_kd,
                  state.link_current_limit);
         outputTelemetryLine(line);
+#elif CONTROL_MODE == CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
+        snprintf(line, sizeof(line),
+                 "TEL LOAD M0=%s M1=%s",
+                 m0LoadStateName(state.m0_load_state),
+                 m1LoadStateName(state.m1_load_state));
+        outputTelemetryLine(line);
 #endif
         snprintf(line, sizeof(line),
                  "TEL M1 %s VEL_T=%.3f VEL=%.3f POS=%.3f IQ_T=%.3f IQ=%.3f UQ=%.3f HZ=%.0f",
@@ -1067,7 +1344,8 @@ static void telemetry_task(void *arg) {
                  state.motor[1].iq, state.motor[1].uq, state.control_hz);
         outputTelemetryLine(line);
 #if CONTROL_MODE == CONTROL_MODE_DUAL_VELOCITY \
-    || CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
+    || CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING \
+    || CONTROL_MODE == CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
         snprintf(line, sizeof(line),
                  "TEL M0 %s VEL_T=%.3f VEL=%.3f POS=%.3f IQ_T=%.3f IQ=%.3f UQ=%.3f",
                  state.motor[0].running ? "RUN" : "STOP",
@@ -1096,8 +1374,14 @@ static void initUart(void) {
 }
 
 static void initPid(MotorControl_t *control) {
+#if CONTROL_MODE == CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
+    float current_limit = control == &motor0 ? M0_NORMAL_IQ_LIMIT : M1_IQ_LIMIT;
+    PID_init(&control->velocity_pid, LOAD_VELOCITY_KP, LOAD_VELOCITY_KI,
+             0.0f, LOAD_VELOCITY_RAMP, current_limit);
+#else
     PID_init(&control->velocity_pid, VELOCITY_KP, VELOCITY_KI, VELOCITY_KD,
              VELOCITY_RAMP, VELOCITY_LIMIT);
+#endif
 #if CONTROL_MODE == CONTROL_MODE_BILATERAL_COUPLING
     PID_init(&control->current_pid, BILATERAL_CURRENT_KP,
              BILATERAL_CURRENT_KI, CURRENT_KD, CURRENT_RAMP, CURRENT_LIMIT);
@@ -1171,6 +1455,13 @@ extern "C" void app_main(void) {
     motor1.running = false;
     bilateral_zero_pending = true;
     bilateral_timestamp_prev = esp_timer_get_time();
+#elif CONTROL_MODE == CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
+    motor0.target_velocity = LOAD_DEFAULT_VELOCITY;
+    motor1.target_velocity = LOAD_DEFAULT_VELOCITY;
+    motor0.running = true;
+    motor1.running = true;
+    m0_load_state = M0_LOAD_STARTING;
+    m1_load_state = M1_LOAD_DRIVE;
 #else
     motor0.target_velocity = M0_DEFAULT_VELOCITY;
     motor1.target_velocity = M1_DEFAULT_VELOCITY;

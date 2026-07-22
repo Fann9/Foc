@@ -1,6 +1,6 @@
 # 双电机控制模式与 UART 协议
 
-本文档说明双电机控制模式、单向主从调速、双向电子轴力反馈，以及 USB 控制台和 UART1 共用的文本命令协议。
+本文档说明双电机控制模式、单向主从调速、双向电子轴力反馈、独立负载响应，以及 USB 控制台和 UART1 共用的文本命令协议。
 
 ## 模式选择
 
@@ -10,8 +10,9 @@
 #define CONTROL_MODE_DUAL_VELOCITY       0
 #define CONTROL_MODE_MASTER_SLAVE_SPEED  1
 #define CONTROL_MODE_BILATERAL_COUPLING  2
+#define CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD 3
 
-#define CONTROL_MODE CONTROL_MODE_BILATERAL_COUPLING
+#define CONTROL_MODE CONTROL_MODE_INDEPENDENT_VOLTAGE_LOAD
 ```
 
 ### DUAL_VELOCITY
@@ -96,6 +97,42 @@ RATIO   = 1.0
 
 `RATIO=1` 表示两台电机相对转角相同，此时固件使用 `Iq0=-Iq`、`Iq1=+Iq` 近似实现相同的轴端反作用力。负值可以反转跟随方向；非 1 传动比时 M1 电流会按比例换算并再次限流。机械摩擦、电流零偏和电机转矩常数误差仍会影响实际手感。
 
+### INDEPENDENT_VOLTAGE_LOAD
+
+M0、M1 完全独立，目标速度默认都为 `50.27rad/s`（约 `480RPM`）。此模式采用速度—电流串环，速度 PI 输出 Iq 目标，电流 PI 输出 q 轴电压 Uq：
+
+```text
+M0：速度PI → Iq最大0.12A → 电流PI → Uq
+             ↓ 达速后明显降速且电流上升
+             固定0.02A低转矩 → 松手转动 → 恢复速度PI
+
+M1：速度PI → Iq最大0.5A → 电流PI → Uq
+             负载越大、速度越低，输出电流越高
+```
+
+M0 状态：
+
+```text
+STARTING → ARMED → SOFT_STOP → RECOVERING → ARMED
+```
+
+- `STARTING`：正常加速，速度达到目标的80%并保持约200ms后进入 `ARMED`。
+- `ARMED`：速度低于目标的70%且 Iq 达到约 `0.08A`，或速度直接低于目标的20%，持续约30ms后进入 `SOFT_STOP`。
+- `SOFT_STOP`：固定使用与目标方向一致的 `0.02A`，手动阻挡时只保留很小的转矩，松手后可自行起转。
+- `RECOVERING`：低转矩使速度达到目标的5%并保持约100ms后，恢复正常速度PI；重新达速后回到 `ARMED`。
+
+M1 会持续尝试恢复目标速度，Iq 最大为 `0.5A`。另外保留独立过流保护：滤波 Iq 达到约 `1A` 并持续约50ms后，进入 `OVERCURRENT`、输出归零约1秒，然后自动重新尝试启动。
+
+默认速度 PI 参数和电压限制：
+
+```text
+M0/M1 速度PI：P=0.03, I=0.2, D=0, RAMP=5A/s
+M0 速度PI LIMIT=0.12A
+M1 速度PI LIMIT=0.5A
+M0/M1 电流PI：P=0.5, I=50, D=0
+电流滤波时间常数=10ms
+```
+
 ## 串口配置
 
 ```text
@@ -131,6 +168,8 @@ STOP ALL
 
 在 `BILATERAL_COUPLING` 模式中，电子轴必须作为整体启停，因此 M0、M1、ALL 三种电机选择写法都会被接受，但效果相同。
 
+在 `INDEPENDENT_VOLTAGE_LOAD` 模式中，M0、M1 可以独立启停。STOP 会清零该电机目标；再次 RUN 时如果目标为零，会恢复默认 `50.27rad/s`。
+
 ## 设置目标速度
 
 ```text
@@ -151,6 +190,14 @@ SET M1 VEL 4
 
 ```text
 ERR LINK_MODE_ONLY
+```
+
+独立负载模式可以分别修改两台电机速度：
+
+```text
+SET M0 VEL 50.27
+SET M1 VEL 50.27
+SET ALL VEL 50.27 50.27
 ```
 
 ## 设置 PID
@@ -179,7 +226,7 @@ SET ALL CPID 0.5 50 0 100000 12.6
 
 整组参数会在控制周期边界一次性生效，并清空相应 PID 的积分、误差和输出历史。主从模式中 M0 的 PID 不参与控制，但仍可配置并在切回双速度模式后使用。
 
-速度 PID 的 `LIMIT` 是 Iq 目标上限，UART 最大允许设置为 `1A`；电流 PID 的电压输出上限最大允许设置为 `12.6V`。FOC 输出还会在 `Motor_setTorque()` 中把最终 Uq 限制为母线电压的一半。
+速度 PID 的 `LIMIT` 是 Iq 目标上限，通常最大允许设置为 `1A`。独立负载模式为了保持两台电机不同的负载特性，UART 分别限制 M0 最大 `0.12A`、M1 最大 `0.5A`。电流 PID 的电压输出上限最大允许设置为 `12.6V`。FOC 输出还会在 `Motor_setTorque()` 中把最终 Uq 限制为母线电压的一半。
 
 ## 设置主从参数
 
@@ -239,6 +286,7 @@ LINK KP=0.8000 KD=0.0300 CURRENT=0.150 RAMP=10.000 RATIO=1.000 E=0.0250 DE_RAW=0
 ```text
 GET MODE
 GET LINK
+GET LOAD
 GET M0 STATE
 GET M1 STATE
 GET ALL STATE
@@ -288,6 +336,7 @@ ERR BAD_VALUE
 ERR ARG_COUNT
 ERR M0_INPUT_ONLY
 ERR LINK_MODE_ONLY
+ERR LOAD_MODE_ONLY
 ERR LINE_TOO_LONG
 ERR BUSY
 ```
@@ -319,3 +368,18 @@ ERR BUSY
 10. 测试结束输入 `STOP ALL`。
 
 首次测试不要直接提高到 `0.5A`，也不要在一台电机被完全锁死时长时间保持较大的位置差。
+
+## 独立负载模式首次测试
+
+1. 上电时不要接触旋转轴，等待 M0、M1 依次完成电角度对齐。
+2. 输入 `GET MODE`，确认返回 `INDEPENDENT_VOLTAGE_LOAD`。
+3. 输入 `GET LOAD`、`GET ALL PARAM` 和 `LOG 10`，确认目标均为 `50.27rad/s`，M0/M1 的 VPID 输出上限分别为 `0.12A/0.5A`。
+4. 等两台电机稳定后，日志中的 M0 状态应从 `STARTING` 变为 `ARMED`。
+5. 使用安全的软质摩擦块逐渐增加 M0 负载。速度低于约 `35.19rad/s` 且 Iq 达到约 `0.08A` 持续30ms后，应进入 `SOFT_STOP`，Iq 目标降至约 `0.02A`。
+6. 释放 M0，确认它先进入 `RECOVERING`，随后恢复到约 `50.27rad/s` 并重新进入 `ARMED`。
+7. 短时间增加 M1 负载，确认速度下降时 Iq 目标向 `0.5A` 增加，释放后速度回到目标。
+8. 不要长时间完全堵住 M1；如果 Iq 达到约 `1A` 持续50ms，应看到 `OVERCURRENT`，输出停止约1秒后重新尝试。
+9. 输入 `GET ALL STATE`，确认 M0、M1 的速度和 Uq 独立变化，彼此没有目标或位置耦合。
+10. 测试结束输入 `STOP ALL`。
+
+不要直接用手接触高速旋转件。建议用软质摩擦块、轴套或负载杆施加阻力，并保证能够立即断电。

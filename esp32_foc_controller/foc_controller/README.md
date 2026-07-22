@@ -5,9 +5,10 @@
 - M0、M1 两台电机独立的速度—电流串级闭环。
 - M0 作为手动输入、控制 M1 单向速度的主从模式。
 - M0、M1 双向位置同步并反馈阻力的电子轴模式。
+- M0 易堵停自动恢复、M1 高电压抗负载的独立速度—电压模式。
 - USB 控制台和 UART1 分别设置两台电机的目标、PID、启停和日志。
 
-当前默认编译 `BILATERAL_COUPLING`。完整模式说明、命令格式和测试步骤见 [README_MODES_UART.md](D:/Word/Code/Gitcode/Foc/esp32_foc_controller/foc_controller/README_MODES_UART.md)。
+当前默认编译 `INDEPENDENT_VOLTAGE_LOAD`。完整模式说明、命令格式和测试步骤见 [README_MODES_UART.md](D:/Word/Code/Gitcode/Foc/esp32_foc_controller/foc_controller/README_MODES_UART.md)。
 
 ## 硬件配置
 
@@ -37,6 +38,8 @@
 
 双速度和单向主从模式沿用上表参数。双向电子轴模式参考第九章力位闭环，将电流 PID 调整为 `P=1.25、I=50`；电流滤波由 `50ms` 缩短为 `10ms`，以降低力反馈延迟。速度低通滤波时间常数仍为 `10ms`。`Motor_setTorque()` 还会将最终 Uq 限制为母线电压的一半。
 
+独立负载模式采用速度—电流串环：速度 PI 为 `P=0.03、I=0.2、RAMP=5A/s`，电流 PI 为 `P=0.5、I=50`。M0 的 Iq 上限为 `0.12A`，堵转后降到 `0.02A`；M1 的 Iq 上限为 `0.5A`，减速时会主动增大转矩。
+
 ## UART1
 
 ```text
@@ -45,15 +48,14 @@ RX：GPIO17
 115200，8N1
 ```
 
-例如在默认双向电子轴模式查询并修改参数：
+例如在默认独立负载模式查询状态：
 
 ```text
 GET MODE
-GET LINK
-SET LINK PARAM 0.8 0.03 0.15 1.0
-SET LINK RAMP 10
-ZERO LINK
-RUN ALL
+GET LOAD
+GET ALL PARAM
+SET ALL VEL 50.27 50.27
+LOG 10
 ```
 
 ## 编译与烧录
@@ -64,4 +66,4 @@ idf.py build
 idf.py -p COM3 flash monitor
 ```
 
-默认双向电子轴模式上电时两台电机依次执行电角度对齐，对齐完成后保持 `STOP`。输入 `RUN ALL` 会以当时位置建立同步零点，随后转动任意一台电机，另一台都会跟随并反馈阻力。
+默认独立负载模式上电时两台电机依次执行电角度对齐，随后各自以 `50.27rad/s`（约 `480RPM`）运行。M0 检测到明显降速和电流上升后切换到 `0.02A` 低转矩状态，松手后自动恢复；M1 减速时最多输出 `0.5A` 尝试保持转速。
