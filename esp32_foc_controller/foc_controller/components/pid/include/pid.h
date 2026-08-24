@@ -63,6 +63,12 @@ void PID_setParams(PID_t *pid, float Kp, float Ki, float Kd, float ramp);
 void PID_setLimit(PID_t *pid, float limit);
 
 /**
+ * @brief 清空积分、误差和输出历史，保留当前 PID 参数
+ * @param pid PID 实例指针
+ */
+void PID_reset(PID_t *pid);
+
+/**
  * @brief 执行一次 PID 计算
  * @param pid    PID 实例指针
  * @param error  当前误差 (设定值 - 测量值)

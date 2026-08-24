@@ -26,6 +26,13 @@ void PID_setLimit(PID_t *pid, float limit) {
     pid->limit = limit;
 }
 
+void PID_reset(PID_t *pid) {
+    pid->error_prev = 0.0f;
+    pid->integral = 0.0f;
+    pid->output_prev = 0.0f;
+    pid->timestamp_prev = esp_timer_get_time();
+}
+
 float PID_update(PID_t *pid, float error) {
     int64_t now = esp_timer_get_time();
     float Ts = (float)(now - pid->timestamp_prev) * 1e-6f;
