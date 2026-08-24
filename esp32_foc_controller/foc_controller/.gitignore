@@ -61,6 +61,9 @@ venv/
 .venv/
 env/
 
+# IDE
+.vscode/
+
 # Language Servers
 .clangd/
 .ccls-cache/
