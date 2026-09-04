@@ -1,5 +1,5 @@
 // FOC 三线程控制器
-// 线程 1：传感器读取 (500Hz) — 高优先级，实时获取编码器角度 + 速度
+// 线程 1：传感器读取 (100Hz) — 高优先级，实时获取编码器角度 + 速度
 // 线程 2：电机控制 (100Hz) — 支持闭环位置 / 闭环速度切换
 // 线程 3：串口通信 (事件驱动) — 接收目标速度 + PID 参数
 //
@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "DengFOC.h"
@@ -49,6 +50,7 @@ static float _normalizeAngle(float angle) {
 static AS5600_t encoder;
 static Motor_t motor;
 static SemaphoreHandle_t angle_mutex;
+static SemaphoreHandle_t pid_mutex;
 
 // 速度低通滤波器 (Tf=0.01s → 截止频率 ~16Hz, 适合 100Hz 控制环)
 static LowPassFilter vel_filter(0.01f);
@@ -62,28 +64,31 @@ static float shared_raw_angle = 0;       // 单圈角度 (用于算电角度)
 static float shared_velocity = 0;        // 滤波后速度 (rad/s)
 static float shared_target = M_PI;       // 目标速度 (rad/s), 默认 π rad/s
 
-// ============ 传感器线程 (500Hz) ============
+// ============ 传感器线程 (100Hz，匹配当前 FreeRTOS Tick) ============
 static void sensor_task(void *arg) {
     float raw_prev = 0;
+    int64_t timestamp_prev = 0;
     bool first_reading = true;
 
     while (1) {
         float raw = AS5600_getAngle_Without_track(&encoder);
-        float full = AS5600_getAngle(&encoder);
+        float full = AS5600_trackAngle(&encoder, raw);
+        int64_t now = esp_timer_get_time();
 
         // 速度计算：用 raw angle 做 wrap-aware 差分
         // 避免多圈追踪在过零点附近因量化噪声导致的速度跳变
-        float dt = 0.002f;  // 500Hz 固定周期
         float velocity = 0;
         if (!first_reading) {
+            float dt = (float)(now - timestamp_prev) * 1e-6f;
             float d_raw = raw - raw_prev;
             if (d_raw > M_PI)       d_raw -= 2.0f * M_PI;  // 正向过零
             else if (d_raw < -M_PI) d_raw += 2.0f * M_PI;  // 反向过零
-            velocity = d_raw / dt;
+            if (dt > 0.0f) velocity = d_raw / dt;
         } else {
             first_reading = false;
         }
         raw_prev = raw;
+        timestamp_prev = now;
         float vel_filtered = vel_filter(velocity);
 
         xSemaphoreTake(angle_mutex, portMAX_DELAY);
@@ -91,7 +96,7 @@ static void sensor_task(void *arg) {
         shared_raw_angle = raw;
         shared_velocity = vel_filtered;
         xSemaphoreGive(angle_mutex);
-        vTaskDelay(pdMS_TO_TICKS(2));  // 2ms = 500Hz
+        vTaskDelay(pdMS_TO_TICKS(10));  // 10ms = 100Hz
     }
 }
 
@@ -130,8 +135,10 @@ static void control_task(void *arg) {
 #elif CONTROL_MODE == CONTROL_MODE_VELOCITY
     // ── 闭环速度控制 (目标由串口设定) ──
 
+    xSemaphoreTake(pid_mutex, portMAX_DELAY);
     ESP_LOGI(TAG, ">> 闭环速度模式 | 默认目标: %.2f rad/s | Kp=%.3f Ki=%.3f",
              shared_target, vel_pid.Kp, vel_pid.Ki);
+    xSemaphoreGive(pid_mutex);
 
     while (1) {
         float raw_angle, velocity, target;
@@ -146,7 +153,9 @@ static void control_task(void *arg) {
 
         // PID 速度控制
         float error = target - velocity;
+        xSemaphoreTake(pid_mutex, portMAX_DELAY);
         float Uq = PID_update(&vel_pid, error);
+        xSemaphoreGive(pid_mutex);
         Uq = _constrain(Uq, -motor.voltage_power_supply / 2, motor.voltage_power_supply / 2);
 
         Motor_setTorque(&motor, Uq, el_angle);
@@ -207,10 +216,14 @@ static void comm_task(void *arg) {
                     buf_stdin[len_stdin] = '\0';
                     float val = atof(buf_stdin);
                     if (buf_stdin[0] == 'p' || buf_stdin[0] == 'P') {
+                        xSemaphoreTake(pid_mutex, portMAX_DELAY);
                         PID_setParams(&vel_pid, fabsf(val), vel_pid.Ki, vel_pid.Kd, vel_pid.output_ramp);
+                        xSemaphoreGive(pid_mutex);
                         printf("Kp = %.4f\n", vel_pid.Kp);
                     } else if (buf_stdin[0] == 'i' || buf_stdin[0] == 'I') {
+                        xSemaphoreTake(pid_mutex, portMAX_DELAY);
                         PID_setParams(&vel_pid, vel_pid.Kp, fabsf(val), vel_pid.Kd, vel_pid.output_ramp);
+                        xSemaphoreGive(pid_mutex);
                         printf("Ki = %.4f\n", vel_pid.Ki);
                     } else {
                         xSemaphoreTake(angle_mutex, portMAX_DELAY);
@@ -236,12 +249,16 @@ static void comm_task(void *arg) {
                     buf_uart[len_uart] = '\0';
                     float val = atof(buf_uart);
                     if (buf_uart[0] == 'p' || buf_uart[0] == 'P') {
+                        xSemaphoreTake(pid_mutex, portMAX_DELAY);
                         PID_setParams(&vel_pid, fabsf(val), vel_pid.Ki, vel_pid.Kd, vel_pid.output_ramp);
+                        xSemaphoreGive(pid_mutex);
                         char rsp[48];
                         snprintf(rsp, sizeof(rsp), "Kp = %.4f\r\n", vel_pid.Kp);
                         uart_write_bytes(UART_PORT, rsp, strlen(rsp));
                     } else if (buf_uart[0] == 'i' || buf_uart[0] == 'I') {
+                        xSemaphoreTake(pid_mutex, portMAX_DELAY);
                         PID_setParams(&vel_pid, vel_pid.Kp, fabsf(val), vel_pid.Kd, vel_pid.output_ramp);
+                        xSemaphoreGive(pid_mutex);
                         char rsp[48];
                         snprintf(rsp, sizeof(rsp), "Ki = %.4f\r\n", vel_pid.Ki);
                         uart_write_bytes(UART_PORT, rsp, strlen(rsp));
@@ -262,7 +279,7 @@ static void comm_task(void *arg) {
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(5));  // 5ms 轮询周期
+        vTaskDelay(pdMS_TO_TICKS(10));  // 10ms 轮询周期，匹配当前 FreeRTOS Tick
     }
 }
 
@@ -288,11 +305,12 @@ extern "C" void app_main(void) {
 
     // 创建互斥锁
     angle_mutex = xSemaphoreCreateMutex();
+    pid_mutex = xSemaphoreCreateMutex();
 
     // 创建线程
-    xTaskCreatePinnedToCore(sensor_task, "sensor", 4096, NULL, 5, NULL, 1);   // 传感器 500Hz
+    xTaskCreatePinnedToCore(sensor_task, "sensor", 4096, NULL, 5, NULL, 1);   // 传感器 100Hz
     xTaskCreatePinnedToCore(control_task, "control", 4096, NULL, 4, NULL, 1);  // 控制 100Hz
     xTaskCreatePinnedToCore(comm_task, "comm", 4096, NULL, 2, NULL, 1);        // 串口 事件驱动
 
-    ESP_LOGI(TAG, "三线程已启动: sensor(5,500Hz) + control(4,100Hz) + comm(2,stdin+UART)");
+    ESP_LOGI(TAG, "三线程已启动: sensor(5,100Hz) + control(4,100Hz) + comm(2,stdin+UART)");
 }

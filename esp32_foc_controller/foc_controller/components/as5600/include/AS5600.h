@@ -26,4 +26,7 @@ float AS5600_getAngle_Without_track(AS5600_t *dev);
 // 读取累计角度（多圈追踪）
 float AS5600_getAngle(AS5600_t *dev);
 
+// 用已读取的单圈角度更新并返回累计角度，避免同一控制周期重复读取 I2C
+float AS5600_trackAngle(AS5600_t *dev, float angle);
+
 #endif

@@ -45,40 +45,28 @@ void AS5600_init(AS5600_t *dev, i2c_port_t port, int sda, int scl, uint32_t freq
              port, sda, scl, freq / 1000);
 }
 
-// 通过 I2C 读取两个寄存器字节并合并为 16 位值
-static uint16_t readTwoBytes(AS5600_t *dev, uint8_t reg_hi, uint8_t reg_lo) {
+// 通过一次 I2C 事务读取两个连续寄存器字节并合并为 16 位值
+static uint16_t readTwoBytes(AS5600_t *dev, uint8_t reg_hi) {
     uint8_t buf[2];
 
-    // 读高位寄存器
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (AS5600_ADDR << 1) | I2C_MASTER_WRITE, true);
     i2c_master_write_byte(cmd, reg_hi, true);
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (AS5600_ADDR << 1) | I2C_MASTER_READ, true);
-    i2c_master_read(cmd, &buf[1], 1, I2C_MASTER_LAST_NACK);
+    i2c_master_read_byte(cmd, &buf[0], I2C_MASTER_ACK);
+    i2c_master_read_byte(cmd, &buf[1], I2C_MASTER_LAST_NACK);
     i2c_master_stop(cmd);
-    i2c_master_cmd_begin(dev->i2c_port, cmd, pdMS_TO_TICKS(100));
+    ESP_ERROR_CHECK(i2c_master_cmd_begin(dev->i2c_port, cmd, pdMS_TO_TICKS(100)));
     i2c_cmd_link_delete(cmd);
 
-    // 读低位寄存器
-    cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (AS5600_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg_lo, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (AS5600_ADDR << 1) | I2C_MASTER_READ, true);
-    i2c_master_read(cmd, &buf[0], 1, I2C_MASTER_LAST_NACK);
-    i2c_master_stop(cmd);
-    i2c_master_cmd_begin(dev->i2c_port, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-
-    return (buf[1] << 8) | buf[0];
+    return (buf[0] << 8) | buf[1];
 }
 
 // 读取原始角度 (0-4095, 12 位分辨率)
 uint16_t AS5600_getRawAngle(AS5600_t *dev) {
-    return readTwoBytes(dev, AS5600_RAW_ANG_HI, AS5600_RAW_ANG_LO);
+    return readTwoBytes(dev, AS5600_RAW_ANG_HI);
 }
 
 // 转换为单圈弧度 (0 ~ 2PI)
@@ -87,12 +75,15 @@ float AS5600_getAngle_Without_track(AS5600_t *dev) {
 }
 
 // 多圈角度追踪：检测过零点并累计圈数
-float AS5600_getAngle(AS5600_t *dev) {
-    float val = AS5600_getAngle_Without_track(dev);
-    float d_angle = val - dev->angle_prev;
+float AS5600_trackAngle(AS5600_t *dev, float angle) {
+    float d_angle = angle - dev->angle_prev;
     if (fabsf(d_angle) > (0.8f * 6.28318530718f)) {
         dev->full_rotations += (d_angle > 0) ? -1 : 1;
     }
-    dev->angle_prev = val;
+    dev->angle_prev = angle;
     return (float)dev->full_rotations * 6.28318530718f + dev->angle_prev;
+}
+
+float AS5600_getAngle(AS5600_t *dev) {
+    return AS5600_trackAngle(dev, AS5600_getAngle_Without_track(dev));
 }
