@@ -51,6 +51,19 @@ foc_controller/
 - **传感器线程** (sensor_task): 高优先级，每 10ms 读取编码器角度，通过互斥锁写入共享变量
 - **控制线程** (control_task): 每 10ms 执行一次 FOC 闭环控制（Park 逆变换 → Clarke 逆变换 → 三相 PWM）
 
+### 控制模式切换
+
+在 `main/main.cpp` 中修改 `CONTROL_MODE` 后重新编译烧录：
+
+```cpp
+#define CONTROL_MODE_POSITION  0   // 闭环位置
+#define CONTROL_MODE_VELOCITY  1   // 闭环速度
+#define CONTROL_MODE_CURRENT   2   // 闭环电流 (Iq)
+#define CONTROL_MODE  CONTROL_MODE_VELOCITY
+```
+
+电流模式移植自 DengFOC Lesson 8：使用 GPIO39 / GPIO36 的 ADC1 两路采样 A/B 相电流，按分流电阻 `0.01Ω`、放大倍数 `50` 换算，经 Clarke/Park 变换得到 Iq。启用前须将驱动板的电流采样输出接至这两个引脚，并根据实际硬件调整 `CURRENT_SENSE_*` 宏。
+
 ### 实例化设计
 
 所有驱动均采用结构体实例化，支持多电机扩展：

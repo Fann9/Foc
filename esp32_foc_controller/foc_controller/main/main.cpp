@@ -7,7 +7,8 @@
 // 修改 CONTROL_MODE 宏即可切换, 重新编译烧录生效
 #define CONTROL_MODE_POSITION  0   // 闭环位置
 #define CONTROL_MODE_VELOCITY  1   // 闭环速度
-#define CONTROL_MODE  CONTROL_MODE_VELOCITY   // ← 在这里切换模式
+#define CONTROL_MODE_CURRENT   2   // 闭环电流 (Iq)
+#define CONTROL_MODE  CONTROL_MODE_CURRENT   // ← 在这里切换模式
 // ======================================================
 
 #include <math.h>
@@ -27,6 +28,7 @@
 #include "DengFOC.h"
 #include "lowpass_filter.h"
 #include "pid.h"
+#include "current_sense.h"
 
 static const char *TAG = "FOC";
 
@@ -39,6 +41,13 @@ static const char *TAG = "FOC";
 #define UART_BAUD       115200
 #define UART_BUF_SIZE   256
 
+// 在线电流检测配置 (Arduino Lesson 8 默认参数)
+// 电流采样输出需分别连接到 GPIO39 / GPIO36 (ADC1)
+#define CURRENT_SENSE_PIN_A       39
+#define CURRENT_SENSE_PIN_B       36
+#define CURRENT_SHUNT_RESISTOR    0.01f
+#define CURRENT_AMP_GAIN          50.0f
+
 #define _constrain(amt, low, high) ((amt) < (low) ? (low) : ((amt) > (high) ? (high) : (amt)))
 
 static float _normalizeAngle(float angle) {
@@ -49,20 +58,43 @@ static float _normalizeAngle(float angle) {
 // ============ 全局实例 ============
 static AS5600_t encoder;
 static Motor_t motor;
+#if CONTROL_MODE == CONTROL_MODE_CURRENT
+static CurrSense_t current_sense;
+#endif
 static SemaphoreHandle_t angle_mutex;
 static SemaphoreHandle_t pid_mutex;
 
 // 速度低通滤波器 (Tf=0.01s → 截止频率 ~16Hz, 适合 100Hz 控制环)
 static LowPassFilter vel_filter(0.01f);
+#if CONTROL_MODE == CONTROL_MODE_CURRENT
+// 电流低通滤波器 (Tf=0.05s → 截止频率 ~3Hz)
+static LowPassFilter current_filter(0.05f);
+#endif
 
 // 速度 PID 控制器
 static PID_t vel_pid;
+#if CONTROL_MODE == CONTROL_MODE_CURRENT
+static PID_t current_pid;
+#endif
 
 // 共享数据：传感器线程写入，控制线程读取
 static float shared_angle = 0;           // 多圈累计角度
 static float shared_raw_angle = 0;       // 单圈角度 (用于算电角度)
 static float shared_velocity = 0;        // 滤波后速度 (rad/s)
-static float shared_target = M_PI;       // 目标速度 (rad/s), 默认 π rad/s
+#if CONTROL_MODE == CONTROL_MODE_CURRENT
+static float shared_current = 0;         // 滤波后 Iq 电流 (A)
+static float shared_target = 0;          // 目标 Iq 电流 (A)，默认零电流
+#else
+static float shared_target = M_PI;       // 目标速度 (rad/s)，默认 π rad/s
+#endif
+
+#if CONTROL_MODE == CONTROL_MODE_VELOCITY
+#define ACTIVE_PID vel_pid
+#elif CONTROL_MODE == CONTROL_MODE_CURRENT
+#define ACTIVE_PID current_pid
+#else
+#define ACTIVE_PID vel_pid
+#endif
 
 // ============ 传感器线程 (100Hz，匹配当前 FreeRTOS Tick) ============
 static void sensor_task(void *arg) {
@@ -91,10 +123,19 @@ static void sensor_task(void *arg) {
         timestamp_prev = now;
         float vel_filtered = vel_filter(velocity);
 
+#if CONTROL_MODE == CONTROL_MODE_CURRENT
+        float el_angle = _normalizeAngle(
+            (float)(motor.DIR * motor.PP) * raw - motor.zero_electric_angle);
+        float current_filtered = current_filter(CurrSense_getIq(&current_sense, el_angle));
+#endif
+
         xSemaphoreTake(angle_mutex, portMAX_DELAY);
         shared_angle = full;
         shared_raw_angle = raw;
         shared_velocity = vel_filtered;
+#if CONTROL_MODE == CONTROL_MODE_CURRENT
+        shared_current = current_filtered;
+#endif
         xSemaphoreGive(angle_mutex);
         vTaskDelay(pdMS_TO_TICKS(10));  // 10ms = 100Hz
     }
@@ -164,14 +205,48 @@ static void control_task(void *arg) {
                  target, velocity, error, Uq);
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+#elif CONTROL_MODE == CONTROL_MODE_CURRENT
+    // ── 闭环电流模式 (Iq，目标由串口设定) ──
+
+    xSemaphoreTake(pid_mutex, portMAX_DELAY);
+    ESP_LOGI(TAG, ">> 闭环电流模式 | 默认目标: %.2f A | Kp=%.3f Ki=%.3f",
+             shared_target, current_pid.Kp, current_pid.Ki);
+    xSemaphoreGive(pid_mutex);
+
+    while (1) {
+        float raw_angle, current, target;
+        xSemaphoreTake(angle_mutex, portMAX_DELAY);
+        raw_angle = shared_raw_angle;
+        current = shared_current;
+        target = shared_target;
+        xSemaphoreGive(angle_mutex);
+
+        float el_angle = _normalizeAngle(
+            (float)(motor.DIR * motor.PP) * raw_angle - motor.zero_electric_angle);
+
+        // PID 电流控制
+        float error = target - current;
+        xSemaphoreTake(pid_mutex, portMAX_DELAY);
+        float Uq = PID_update(&current_pid, error);
+        xSemaphoreGive(pid_mutex);
+        Uq = _constrain(Uq, -motor.voltage_power_supply / 2, motor.voltage_power_supply / 2);
+
+        Motor_setTorque(&motor, Uq, el_angle);
+
+        ESP_LOGI(TAG, "目标: %.2f A, Iq: %.2f A, 误差: %.2f, Uq: %.2f",
+                 target, current, error, Uq);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+#else
+#error "Invalid CONTROL_MODE"
 #endif
 }
 
 // ============ 通信线程 — 双通道: stdin (idf.py monitor) + UART ============
 // 接收格式: <命令> + Enter
-//   3.14  → 设置目标速度 3.14 rad/s
-//   0     → 停止
-//   -5    → 反向 5 rad/s
+//   3.14  → 设置目标值（速度 rad/s 或 Iq A）
+//   0     → 停止 / 零电流
+//   -5    → 设置负目标值
 //   p0.13 → 设置 Kp
 //   i0.01 → 设置 Ki
 static void comm_task(void *arg) {
@@ -194,7 +269,7 @@ static void comm_task(void *arg) {
     const char *help =
         "\n=== FOC Motor Controller ===\n"
         "Commands (type + Enter):\n"
-        "  <number>  → set target velocity (rad/s)\n"
+        "  <number>  → set target (velocity rad/s or Iq A)\n"
         "  p<number> → set Kp\n"
         "  i<number> → set Ki\n"
         "==============================\n";
@@ -214,22 +289,24 @@ static void comm_task(void *arg) {
             if (ch == '\n' || ch == '\r') {
                 if (len_stdin > 0) {
                     buf_stdin[len_stdin] = '\0';
-                    float val = atof(buf_stdin);
                     if (buf_stdin[0] == 'p' || buf_stdin[0] == 'P') {
+                        float val = atof(buf_stdin + 1);
                         xSemaphoreTake(pid_mutex, portMAX_DELAY);
-                        PID_setParams(&vel_pid, fabsf(val), vel_pid.Ki, vel_pid.Kd, vel_pid.output_ramp);
+                        PID_setParams(&ACTIVE_PID, fabsf(val), ACTIVE_PID.Ki, ACTIVE_PID.Kd, ACTIVE_PID.output_ramp);
                         xSemaphoreGive(pid_mutex);
-                        printf("Kp = %.4f\n", vel_pid.Kp);
+                        printf("Kp = %.4f\n", ACTIVE_PID.Kp);
                     } else if (buf_stdin[0] == 'i' || buf_stdin[0] == 'I') {
+                        float val = atof(buf_stdin + 1);
                         xSemaphoreTake(pid_mutex, portMAX_DELAY);
-                        PID_setParams(&vel_pid, vel_pid.Kp, fabsf(val), vel_pid.Kd, vel_pid.output_ramp);
+                        PID_setParams(&ACTIVE_PID, ACTIVE_PID.Kp, fabsf(val), ACTIVE_PID.Kd, ACTIVE_PID.output_ramp);
                         xSemaphoreGive(pid_mutex);
-                        printf("Ki = %.4f\n", vel_pid.Ki);
+                        printf("Ki = %.4f\n", ACTIVE_PID.Ki);
                     } else {
+                        float val = atof(buf_stdin);
                         xSemaphoreTake(angle_mutex, portMAX_DELAY);
                         shared_target = val;
                         xSemaphoreGive(angle_mutex);
-                        printf("Target = %.2f rad/s\n", val);
+                        printf("Target = %.2f\n", val);
                     }
                     len_stdin = 0;
                 }
@@ -247,27 +324,29 @@ static void comm_task(void *arg) {
             if (uch == '\n' || uch == '\r') {
                 if (len_uart > 0) {
                     buf_uart[len_uart] = '\0';
-                    float val = atof(buf_uart);
                     if (buf_uart[0] == 'p' || buf_uart[0] == 'P') {
+                        float val = atof(buf_uart + 1);
                         xSemaphoreTake(pid_mutex, portMAX_DELAY);
-                        PID_setParams(&vel_pid, fabsf(val), vel_pid.Ki, vel_pid.Kd, vel_pid.output_ramp);
+                        PID_setParams(&ACTIVE_PID, fabsf(val), ACTIVE_PID.Ki, ACTIVE_PID.Kd, ACTIVE_PID.output_ramp);
                         xSemaphoreGive(pid_mutex);
                         char rsp[48];
-                        snprintf(rsp, sizeof(rsp), "Kp = %.4f\r\n", vel_pid.Kp);
+                        snprintf(rsp, sizeof(rsp), "Kp = %.4f\r\n", ACTIVE_PID.Kp);
                         uart_write_bytes(UART_PORT, rsp, strlen(rsp));
                     } else if (buf_uart[0] == 'i' || buf_uart[0] == 'I') {
+                        float val = atof(buf_uart + 1);
                         xSemaphoreTake(pid_mutex, portMAX_DELAY);
-                        PID_setParams(&vel_pid, vel_pid.Kp, fabsf(val), vel_pid.Kd, vel_pid.output_ramp);
+                        PID_setParams(&ACTIVE_PID, ACTIVE_PID.Kp, fabsf(val), ACTIVE_PID.Kd, ACTIVE_PID.output_ramp);
                         xSemaphoreGive(pid_mutex);
                         char rsp[48];
-                        snprintf(rsp, sizeof(rsp), "Ki = %.4f\r\n", vel_pid.Ki);
+                        snprintf(rsp, sizeof(rsp), "Ki = %.4f\r\n", ACTIVE_PID.Ki);
                         uart_write_bytes(UART_PORT, rsp, strlen(rsp));
                     } else {
+                        float val = atof(buf_uart);
                         xSemaphoreTake(angle_mutex, portMAX_DELAY);
                         shared_target = val;
                         xSemaphoreGive(angle_mutex);
                         char rsp[48];
-                        snprintf(rsp, sizeof(rsp), "Target = %.2f rad/s\r\n", val);
+                        snprintf(rsp, sizeof(rsp), "Target = %.2f\r\n", val);
                         uart_write_bytes(UART_PORT, rsp, strlen(rsp));
                     }
                     len_uart = 0;
@@ -296,12 +375,22 @@ extern "C" void app_main(void) {
     // 初始化电机 (12.3V, PWM: 32/33/25)
     Motor_init(&motor, 12.3f, 32, 33, 25, &encoder);
 
+    // 电流模式下初始化在线电流检测并校准零偏，校准时请保持电机无驱动
+#if CONTROL_MODE == CONTROL_MODE_CURRENT
+    CurrSense_init(&current_sense, CURRENT_SENSE_PIN_A, CURRENT_SENSE_PIN_B,
+                   CURRENT_SHUNT_RESISTOR, CURRENT_AMP_GAIN);
+#endif
+
     // 电角度校准：极对数 7，方向 -1
     Motor_alignSensor(&motor, 7, -1);
 
     // 初始化速度 PID (限幅=供电电压/2，与 DengFOC 一致)
     PID_init(&vel_pid, 0.0f, 0.0f, 0.0f, 0.0f, motor.voltage_power_supply / 2);
     PID_setParams(&vel_pid, 0.13f, 0.0f, 0.0f, 0.0f);  // 风格同 DFOC_M0_SET_VEL_PID
+#if CONTROL_MODE == CONTROL_MODE_CURRENT
+    PID_init(&current_pid, 0.0f, 0.0f, 0.0f, 0.0f, motor.voltage_power_supply / 2);
+    PID_setParams(&current_pid, 0.0f, 0.0f, 0.0f, 100000.0f);  // 初始关闭电流 PID，待串口调参后启用
+#endif
 
     // 创建互斥锁
     angle_mutex = xSemaphoreCreateMutex();
