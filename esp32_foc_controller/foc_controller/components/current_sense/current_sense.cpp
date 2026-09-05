@@ -5,6 +5,7 @@
 #include "esp_rom_sys.h"
 
 static const char *TAG = "CurrentSense";
+static adc_oneshot_unit_handle_t adc1_handle = NULL;
 
 #define ADC_VOLTAGE       3.3f
 #define ADC_RESOLUTION    4095.0f
@@ -29,10 +30,14 @@ void CurrSense_init(CurrSense_t *dev, int pin_a, int pin_b, float shunt_resistor
     ESP_ERROR_CHECK(adc_oneshot_io_to_channel(pin_b, &unit_b, &dev->channel_b));
     ESP_ERROR_CHECK(unit_a == ADC_UNIT_1 && unit_b == ADC_UNIT_1 ? ESP_OK : ESP_ERR_INVALID_ARG);
 
-    adc_oneshot_unit_init_cfg_t unit_cfg;
-    memset(&unit_cfg, 0, sizeof(unit_cfg));
-    unit_cfg.unit_id = ADC_UNIT_1;
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &dev->adc_handle));
+    // 两台电机的四路采样均在 ADC1，共用同一个 oneshot unit。
+    if (adc1_handle == NULL) {
+        adc_oneshot_unit_init_cfg_t unit_cfg;
+        memset(&unit_cfg, 0, sizeof(unit_cfg));
+        unit_cfg.unit_id = ADC_UNIT_1;
+        ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &adc1_handle));
+    }
+    dev->adc_handle = adc1_handle;
 
     adc_oneshot_chan_cfg_t chan_cfg;
     memset(&chan_cfg, 0, sizeof(chan_cfg));

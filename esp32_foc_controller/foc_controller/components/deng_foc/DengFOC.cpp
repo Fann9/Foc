@@ -38,8 +38,10 @@ static void motor_setPwm(Motor_t *motor, float Ua, float Ub, float Uc) {
 }
 
 // 初始化电机：创建 MCPWM 定时器 + 3 路 operator/comparator/generator
-void Motor_init(Motor_t *motor, float voltage, int pin_a, int pin_b, int pin_c, AS5600_t *encoder) {
+void Motor_init(Motor_t *motor, int mcpwm_group, float voltage,
+                int pin_a, int pin_b, int pin_c, AS5600_t *encoder) {
     memset(motor, 0, sizeof(Motor_t));
+    motor->mcpwm_group = mcpwm_group;
     motor->voltage_power_supply = voltage;
     motor->pwm_pins[0] = pin_a;
     motor->pwm_pins[1] = pin_b;
@@ -51,7 +53,7 @@ void Motor_init(Motor_t *motor, float voltage, int pin_a, int pin_b, int pin_c, 
     // 创建 MCPWM 定时器
     mcpwm_timer_config_t timer_config;
     memset(&timer_config, 0, sizeof(timer_config));
-    timer_config.group_id = 0;
+    timer_config.group_id = mcpwm_group;
     timer_config.clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT;
     timer_config.resolution_hz = MCPWM_RESOLUTION_HZ;
     timer_config.period_ticks = MCPWM_RESOLUTION_HZ / MCPWM_FREQ_HZ;
@@ -62,7 +64,7 @@ void Motor_init(Motor_t *motor, float voltage, int pin_a, int pin_b, int pin_c, 
     for (int i = 0; i < 3; i++) {
         mcpwm_operator_config_t oper_config;
         memset(&oper_config, 0, sizeof(oper_config));
-        oper_config.group_id = 0;
+        oper_config.group_id = mcpwm_group;
         ESP_ERROR_CHECK(mcpwm_new_operator(&oper_config, &motor->oper[i]));
         ESP_ERROR_CHECK(mcpwm_operator_connect_timer(motor->oper[i], motor->timer));
 
@@ -88,7 +90,8 @@ void Motor_init(Motor_t *motor, float voltage, int pin_a, int pin_b, int pin_c, 
     ESP_ERROR_CHECK(mcpwm_timer_enable(motor->timer));
     ESP_ERROR_CHECK(mcpwm_timer_start_stop(motor->timer, MCPWM_TIMER_START_NO_STOP));
 
-    ESP_LOGI(TAG, "Motor initialized (30kHz, GPIO %d/%d/%d)", pin_a, pin_b, pin_c);
+    ESP_LOGI(TAG, "Motor initialized (MCPWM group %d, 30kHz, GPIO %d/%d/%d)",
+             mcpwm_group, pin_a, pin_b, pin_c);
 }
 
 // 设置 Uq 电压和电角度 → Park 逆变换 + Clarke 逆变换 → 三相 PWM

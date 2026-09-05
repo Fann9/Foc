@@ -16,6 +16,7 @@ typedef struct {
     mcpwm_oper_handle_t oper[3];
     mcpwm_cmpr_handle_t comparator[3];
     mcpwm_gen_handle_t generator[3];
+    int mcpwm_group;             // MCPWM 组号，每台电机使用独立组
     // 电机参数
     int pwm_pins[3];             // U/V/W 三相 GPIO
     float voltage_power_supply;  // 电源电压
@@ -26,8 +27,9 @@ typedef struct {
     AS5600_t *encoder;
 } Motor_t;
 
-// 初始化电机：配置 MCPWM 三路 PWM，关联编码器
-void Motor_init(Motor_t *motor, float voltage, int pin_a, int pin_b, int pin_c, AS5600_t *encoder);
+// 初始化电机：配置指定 MCPWM 组的三路 PWM，关联编码器
+void Motor_init(Motor_t *motor, int mcpwm_group, float voltage,
+                int pin_a, int pin_b, int pin_c, AS5600_t *encoder);
 
 // 电角度校准：施加固定电压对齐转子，记录零电角度
 void Motor_alignSensor(Motor_t *motor, int pp, int dir);
