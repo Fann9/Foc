@@ -1,141 +1,97 @@
 # ESP32 FOC 电机控制器
 
-基于 ESP32 + ESP-IDF v6.0 的 FOC (磁场定向控制) 电机控制器。
+基于 ESP32 + ESP-IDF v6.0 的 FOC 电机控制器。本版本按 `第九章a+b 位置闭环，速度闭环升级版（加上电流环）` 中 DengFOC V0.4 示例的控制链路和参数移植。
 
 ## 硬件
 
-| 组件 | 型号/参数 |
-|------|----------|
-| 主控 | ESP32 |
-| 电机驱动 | 外置驱动板（自带互补 PWM 和死区控制） |
-| 编码器 | AS5600 磁编码器 (I2C) |
-| 电机 | 7 极对数 BLDC |
-
-### 引脚分配
-
-| 功能 | GPIO |
-|------|------|
-| PWM U 相 | 32 |
-| PWM V 相 | 33 |
-| PWM W 相 | 25 |
+| 功能 | ESP32 GPIO |
+|------|------------|
+| PWM U / V / W 相 | 32 / 33 / 25 |
 | 电机使能 | 12 |
-| I2C SDA | 19 |
-| I2C SCL | 18 |
+| AS5600 SDA / SCL | 19 / 18 |
+| A 相电流采样（VN） | 39 |
+| B 相电流采样（VP） | 36 |
 
-## 软件架构
+- 驱动器供电电压：`12.6V`
+- 电机极对数：`7`
+- 传感器方向：`-1`
+- 分流电阻：`0.01Ω`
+- 运放增益：`50`
+- PWM：`30kHz`，8 位分辨率
 
-```
-foc_controller/
-├── main/
-│   └── main.cpp              # 主程序：双线程启动
-├── components/
-│   ├── deng_foc/             # FOC 算法库 (MCPWM 驱动)
-│   │   ├── DengFOC.cpp
-│   │   └── include/DengFOC.h
-│   └── as5600/               # AS5600 编码器驱动 (I2C)
-│       ├── AS5600.cpp
-│       └── include/AS5600.h
-└── CMakeLists.txt
-```
+## 控制模式
 
-### 双线程模型
-
-```
-┌─────────────────┐    mutex     ┌──────────────────┐
-│  sensor_task     │ ──────────→ │  control_task      │
-│  优先级 5, 100Hz  │  shared     │  优先级 4, 100Hz    │
-│  读 AS5600 编码器  │  angle      │  FOC 计算 + PWM 输出 │
-└─────────────────┘             └──────────────────┘
-```
-
-- **传感器线程** (sensor_task): 高优先级，每 10ms 读取编码器角度，通过互斥锁写入共享变量
-- **控制线程** (control_task): 每 10ms 执行一次 FOC 闭环控制（Park 逆变换 → Clarke 逆变换 → 三相 PWM）
-
-### 控制模式切换
-
-在 `main/main.cpp` 中修改 `CONTROL_MODE` 后重新编译烧录：
+在 `main/main.cpp` 中修改 `CONTROL_MODE`，重新编译烧录后生效：
 
 ```cpp
-#define CONTROL_MODE_POSITION  0   // 闭环位置
-#define CONTROL_MODE_VELOCITY  1   // 闭环速度
-#define CONTROL_MODE_CURRENT   2   // 闭环电流 (Iq)
-#define CONTROL_MODE  CONTROL_MODE_VELOCITY
+#define CONTROL_MODE_FORCE_ANGLE                 0 // 位置 → 电流 → 电压
+#define CONTROL_MODE_VELOCITY_CURRENT            1 // 速度 → 电流 → 电压
+#define CONTROL_MODE_POSITION_VELOCITY_CURRENT   2 // 位置 → 速度 → 电流 → 电压
+#define CONTROL_MODE_CURRENT                     3 // 电流 → 电压
+
+#define CONTROL_MODE CONTROL_MODE_VELOCITY_CURRENT
 ```
 
-电流模式移植自 DengFOC Lesson 8：使用 GPIO39 / GPIO36 的 ADC1 两路采样 A/B 相电流，按分流电阻 `0.01Ω`、放大倍数 `50` 换算，经 Clarke/Park 变换得到 Iq。启用前须将驱动板的电流采样输出接至这两个引脚，并根据实际硬件调整 `CURRENT_SENSE_*` 宏。
+默认启用 Arduino 示例中实际运行的速度—电流串级控制。
 
-### 实例化设计
+### Arduino 原始参数
 
-所有驱动均采用结构体实例化，支持多电机扩展：
+| 模式 | 角度 PID | 速度 PID | 电流 PID |
+|------|----------|----------|----------|
+| 力位 | `0.5 / 0 / 0.003`，限幅 `0.1A` | — | `1.25 / 50 / 0` |
+| 速度—电流 | — | `3 / 2 / 0`，限幅 `0.5A` | `0.5 / 50 / 0` |
+| 位置—速度—电流 | `1 / 0 / 0`，限幅 `30rad/s` | `0.02 / 1 / 0`，限幅 `0.5A` | `5 / 200 / 0` |
+| 电流力矩 | — | — | `5 / 200 / 0` |
 
-```c
-// 每个电机/编码器独立实例
-AS5600_t encoder;
-Motor_t motor;
+所有 PID 的输出变化率均为 `100000`。速度低通滤波时间常数为 `10ms`，电流低通滤波时间常数为 `50ms`。
 
-// 初始化时绑定硬件和关联关系
-AS5600_init(&encoder, I2C_NUM_0, 19, 18, 400000);
-Motor_init(&motor, 12.3f, 32, 33, 25, &encoder);
+## 软件结构
+
+控制计算集中在一个固定周期任务中，保持与 Arduino `loop()` 相同的先后关系：
+
+```text
+control_task，1kHz
+  编码器采样 → 速度计算/滤波 → 电流采样/滤波
+             → 外环 PID → 电流 PID → FOC/PWM
+
+comm_task             串口命令，不参与控制时序
+telemetry_task，20Hz  状态日志，不参与控制计算
 ```
 
-扩展第二个电机：
+将控制链拆成三个不同频率的控制任务会额外引入跨线程数据时序问题，因此基准移植版只使用一个控制任务；通信和日志仍独立运行。
 
-```c
-AS5600_t encoder2;
-Motor_t motor2;
-AS5600_init(&encoder2, I2C_NUM_1, 21, 22, 400000);
-Motor_init(&motor2, 12.3f, 4, 16, 17, &encoder2);
-```
+## 串口命令
 
-## FOC 控制流程
+命令以回车结束，可通过 USB 控制台或 UART1（TX=GPIO16，RX=GPIO17）输入：
 
-```
-目标角度 ──→ PI 控制器 ──→ Uq 电压
-                              │
-                    电角度 ←── 编码器
-                              │
-                     Park 逆变换 (Uq → Uα, Uβ)
-                              │
-                    Clarke 逆变换 (Uα,Uβ → Ua,Ub,Uc)
-                              │
-                    MCPWM 三相 PWM 输出 (30kHz)
-```
+| 命令 | 说明 |
+|------|------|
+| `<number>` | 设置当前模式目标值 |
+| `s` | 将目标值设为 0 |
+| `q` | 查看角度、速度、电流 PID 的 P/I 参数 |
 
-## 编译和烧录
+速度模式的目标单位是 `rad/s`，`6.28rad/s` 约等于每秒一圈。电流模式的目标单位是 A，位置模式的目标单位是 rad。
 
-```bash
-# 设置目标芯片
-idf.py set-target esp32s3
+## 编译、烧录和监控
 
-# 编译
+```powershell
+idf.py set-target esp32
 idf.py build
-
-# 烧录 + 监控
-idf.py flash monitor
+idf.py -p COM3 flash
+idf.py -p COM3 monitor
 ```
 
-## API 参考
+上电时会进行约 1 秒的电角度对齐。默认速度模式完整保留 Arduino 的高增益参数；编码器静止噪声可能使速度环输出快速触及 `±0.5A`，该现象属于原参数基准的测试结果，后续调参应在此基准上单独进行。
 
-### AS5600 编码器
+## 主要组件
 
-| 函数 | 说明 |
-|------|------|
-| `AS5600_init(dev, port, sda, scl, freq)` | 初始化编码器 |
-| `AS5600_getRawAngle(dev)` | 读取原始角度 (0-4095) |
-| `AS5600_getAngle_Without_track(dev)` | 单圈角度 (0~2π rad) |
-| `AS5600_getAngle(dev)` | 多圈累计角度 |
-
-### Motor 电机
-
-| 函数 | 说明 |
-|------|------|
-| `Motor_init(motor, voltage, a, b, c, encoder)` | 初始化电机 MCPWM |
-| `Motor_alignSensor(motor, pp, dir)` | 电角度校准 |
-| `Motor_setTorque(motor, Uq, angle_el)` | 设置力矩 |
-| `Motor_getAngle(motor)` | 获取累计角度 |
-| `Motor_electricalAngle(motor)` | 获取当前电角度 |
-
-## 依赖
-
-- ESP-IDF v6.0+
-- 灯哥开源 DengFOC 库 (已移植为 ESP-IDF 原生 API)
+```text
+foc_controller/
+├── main/main.cpp                 控制模式、参数、任务和串口
+├── components/as5600/            AS5600 编码器驱动
+├── components/current_sense/     双路在线电流采样
+├── components/deng_foc/          FOC 与三相 PWM
+├── components/lowpass_filter/    低通滤波器
+├── components/pid/               位置型 PID
+└── sdkconfig.defaults            FreeRTOS 1kHz tick
+```

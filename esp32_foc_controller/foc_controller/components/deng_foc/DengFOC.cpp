@@ -115,12 +115,12 @@ float Motor_electricalAngle(Motor_t *motor) {
     );
 }
 
-// 电角度校准：施加 Uq=3V 指向 3PI/2 方向，3 秒后读取实际电角度作为零偏
+// 电角度校准：施加 Uq=3V 指向 3PI/2 方向，1 秒后读取实际电角度作为零偏
 void Motor_alignSensor(Motor_t *motor, int pp, int dir) {
     motor->PP = pp;
     motor->DIR = dir;
     Motor_setTorque(motor, 3, _3PI_2);
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    vTaskDelay(pdMS_TO_TICKS(1000));
     motor->zero_electric_angle = Motor_electricalAngle(motor);
     Motor_setTorque(motor, 0, _3PI_2);
     ESP_LOGI(TAG, "零电角度: %.4f (PP=%d, DIR=%d)", motor->zero_electric_angle, pp, dir);

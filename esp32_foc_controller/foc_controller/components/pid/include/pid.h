@@ -1,6 +1,6 @@
 /**
  * @file pid.h
- * @brief 增量型 PID 控制器 (C 语言接口)
+ * @brief 位置型 PID 控制器 (C 语言接口)
  *
  * 算法与 DengFOC 库一致：
  *   P   = Kp * error

@@ -1,0 +1,2 @@
+# DengFOC 控制任务以 1ms 为基本周期
+CONFIG_FREERTOS_HZ=1000
