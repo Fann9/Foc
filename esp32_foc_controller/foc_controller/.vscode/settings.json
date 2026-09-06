@@ -2,12 +2,16 @@
   "C_Cpp.intelliSenseEngine": "default",
   "idf.extensionActivationMode": "always",
   "idf.openOcdConfigs": [
-    "board/esp32s3-builtin.cfg"
+    "interface/ftdi/esp32_devkitj_v1.cfg",
+    "target/esp32.cfg"
   ],
-  "idf.portWin": "COM3",
-  "idf.currentSetup": "F:\\Users\\66449\\esp\\v6.0\\esp-idf",
+  "idf.port": "/dev/ttyCH341USB0",
+  "idf.currentSetup": "/home/al1s/git/esp/esp-idf",
   "idf.customExtraVars": {
-    "IDF_TARGET": "esp32s3"
+    "IDF_TARGET": "esp32",
+    "IDF_PATH": "/home/al1s/git/esp/esp-idf",
+    "IDF_TOOLS_PATH": "/home/al1s/.espressif",
+    "IDF_PYTHON_ENV_PATH": "/home/al1s/.espressif/python_env/idf6.0_py3.10_env"
   },
   "idf.flashType": "UART"
 }
