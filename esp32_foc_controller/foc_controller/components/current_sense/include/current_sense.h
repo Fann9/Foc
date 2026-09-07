@@ -5,7 +5,10 @@
 
 // 两相在线电流检测实例：由 Ia、Ib 推导 Iq
 typedef struct {
-    adc_oneshot_unit_handle_t adc_handle;
+    adc_oneshot_unit_handle_t adc_handle_a;
+    adc_oneshot_unit_handle_t adc_handle_b;
+    adc_unit_t unit_a;
+    adc_unit_t unit_b;
     adc_channel_t channel_a;
     adc_channel_t channel_b;
     int pin_a;

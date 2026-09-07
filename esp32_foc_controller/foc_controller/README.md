@@ -8,19 +8,23 @@
 - M0 易堵停自动恢复、M1 高电压抗负载的独立速度—电压模式。
 - USB 控制台和 UART1 分别设置两台电机的目标、PID、启停和日志。
 
-当前默认编译 `INDEPENDENT_VOLTAGE_LOAD`。完整模式说明、命令格式和测试步骤见 [README_MODES_UART.md](D:/Word/Code/Gitcode/Foc/esp32_foc_controller/foc_controller/README_MODES_UART.md)。
+当前上电默认进入 `BILATERAL_COUPLING`。两台电机完成对齐后会自动进入双向电子轴控制，并以当时位置建立同步零点。GPIO0 按键可以通过单击到四击在四种模式间切换，完整映射、命令格式和测试步骤见 [README_MODES_UART.md](D:/Word/Code/Gitcode/Foc/esp32_foc_controller/foc_controller/README_MODES_UART.md)。
 
 ## 硬件配置
 
 | 功能 | M0 | M1 |
 |------|----|----|
-| PWM U / V / W | GPIO32 / GPIO33 / GPIO25 | GPIO26 / GPIO27 / GPIO14 |
+| PWM U / V / W | GPIO1 / GPIO2 / GPIO5 | GPIO6 / GPIO7 / GPIO8 |
 | MCPWM 组 | Group 0 | Group 1 |
-| AS5600 SDA / SCL | GPIO19 / GPIO18（I2C0） | GPIO23 / GPIO5（I2C1） |
-| A / B 相电流采样 | GPIO39 / GPIO36 | GPIO35 / GPIO34 |
+| AS5600 SDA / SCL | GPIO15 / GPIO14（I2C0） | GPIO13 / GPIO12（I2C1） |
+| A / B 相电流采样 | GPIO4 / GPIO9 | GPIO10 / GPIO11 |
 | 传感器方向 | `-1` | `-1` |
 
-两路驱动共用 GPIO12 使能。公共参数如下：
+模式按键使用 GPIO0，内部上拉、按下接地。GPIO0 是启动配置引脚，上电或复位时不要按住。
+
+工程目标为 ESP32-S3，两路驱动共用 GPIO35 使能；初始化期间保持低电平，PWM、ADC 初始化完成后置高。公共参数如下：
+
+当前 `main/main.cpp` 中设置了 `MOTOR1_ENABLED=1`，两台电机均会初始化、对齐并自动进入双向电子轴模式。电流采样支持每个通道分别使用 ADC1 或 ADC2，因此 M1 可以使用 GPIO10（ADC1）和 GPIO11（ADC2）。
 
 - 驱动器供电电压：`12.6V`
 - 电机极对数：`7`
@@ -48,22 +52,21 @@ RX：GPIO17
 115200，8N1
 ```
 
-例如在默认独立负载模式查询状态：
+例如在默认双向电子轴模式查询状态：
 
 ```text
 GET MODE
-GET LOAD
+GET LINK
 GET ALL PARAM
-SET ALL VEL 50.27 50.27
 LOG 10
 ```
 
 ## 编译与烧录
 
 ```powershell
-idf.py set-target esp32
+idf.py set-target esp32s3
 idf.py build
 idf.py -p COM3 flash monitor
 ```
 
-默认独立负载模式上电时两台电机依次执行电角度对齐，随后各自以 `50.27rad/s`（约 `480RPM`）运行。M0 检测到明显降速和电流上升后切换到 `0.02A` 低转矩状态，松手后自动恢复；M1 减速时最多输出 `0.5A` 尝试保持转速。
+默认双向电子轴模式上电时两台电机依次执行电角度对齐，随后自动进入 RUN，并以当时位置建立同步零点。此时转动任意一台电机，另一台会跟随并反馈阻力，无需再输入 `RUN ALL`。
