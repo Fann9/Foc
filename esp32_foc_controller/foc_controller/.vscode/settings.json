@@ -8,7 +8,7 @@
   "idf.port": "/dev/ttyCH341USB0",
   "idf.currentSetup": "/home/al1s/git/esp/esp-idf",
   "idf.customExtraVars": {
-    "IDF_TARGET": "esp32",
+    "IDF_TARGET": "esp32s3",
     "IDF_PATH": "/home/al1s/git/esp/esp-idf",
     "IDF_TOOLS_PATH": "/home/al1s/.espressif",
     "IDF_PYTHON_ENV_PATH": "/home/al1s/.espressif/python_env/idf6.0_py3.10_env"
