@@ -1,8 +1,3 @@
-// DengFOC 双电机 ESP-IDF 控制器
-// 控制线程：1kHz 顺序执行传感器采样、速度环、电流环和 PWM
-// 通信线程：USB 控制台与 UART1 命令解析
-// 日志线程：按配置频率输出状态，不参与控制计算
-
 // ==================== 控制模式 ====================
 #define CONTROL_MODE_DUAL_VELOCITY       0 // M0/M1 独立速度-电流闭环
 #define CONTROL_MODE_MASTER_SLAVE_SPEED  1 // M0 手轮输入，M1 单向调速

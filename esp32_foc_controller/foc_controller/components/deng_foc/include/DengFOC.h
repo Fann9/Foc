@@ -1,3 +1,6 @@
+// author: al1s
+// 移植DengFOC库, Arduino -> ESP-IDF支持函数
+
 #ifndef DENG_FOC_H
 #define DENG_FOC_H
 

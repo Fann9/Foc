@@ -61,9 +61,6 @@ venv/
 .venv/
 env/
 
-# IDE
-.vscode/
-
 # Language Servers
 .clangd/
 .ccls-cache/
@@ -79,3 +76,6 @@ Desktop.ini
 *.workspace # General workspace files, can be from various tools
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
+
+# local file
+Question.md
