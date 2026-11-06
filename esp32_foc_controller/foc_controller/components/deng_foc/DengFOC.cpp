@@ -1,6 +1,7 @@
-// 灯哥开源，遵循GNU协议，转载请著名版权！
-// 基于原版代码移植到 ESP-IDF 原生 API (MCPWM)
-// 重构为实例化结构体，支持多电机并存
+// author: al1s
+// 移植DengFOC库, Arduino -> ESP-IDF支持函数
+// 使用ESP-IDF API (MCPWM)
+// 主要重构为实例化结构体，支持多电机并存
 
 #define _USE_MATH_DEFINES
 #include "DengFOC.h"

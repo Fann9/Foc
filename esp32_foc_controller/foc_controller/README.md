@@ -1,6 +1,6 @@
 # ESP32 双电机 FOC 控制器
 
-基于 ESP32 + ESP-IDF v6.0 的双电机 FOC 控制器，控制算法和参数来自 DengFOC 第九、十课示例。目前支持：
+基于 ESP32 + ESP-IDF v6.0 的双电机 FOC 控制器，控制算法和参数来自 DengFOC。目前支持：
 
 - M0、M1 两台电机独立的速度—电流串级闭环。
 - M0 作为手动输入、控制 M1 单向速度的主从模式。
@@ -8,7 +8,7 @@
 - M0 易堵停自动恢复、M1 高电压抗负载的独立速度—电压模式。
 - USB 控制台和 UART1 分别设置两台电机的目标、PID、启停和日志。
 
-当前上电默认进入 `BILATERAL_COUPLING`。两台电机完成对齐后会自动进入双向电子轴控制，并以当时位置建立同步零点。GPIO0 按键可以通过单击到四击在四种模式间切换，完整映射、命令格式和测试步骤见 [README_MODES_UART.md](D:/Word/Code/Gitcode/Foc/esp32_foc_controller/foc_controller/README_MODES_UART.md)。
+当前上电默认进入 `BILATERAL_COUPLING`。两台电机完成对齐后会自动进入双向电子轴控制，并以当时位置建立同步零点。GPIO0 按键可以通过单击到四击在四种模式间切换，完整映射、命令格式和测试步骤见 [README_MODES_UART.md](README_MODES_UART.md)。
 
 ## 硬件配置
 

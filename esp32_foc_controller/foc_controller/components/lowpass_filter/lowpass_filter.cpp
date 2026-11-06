@@ -1,4 +1,6 @@
 // 低通滤波器 — 改编自 Arduino 版本，适配 ESP-IDF
+
+// 标记
 // 替换 micros() → esp_timer_get_time()
 // 替换 unsigned long → int64_t
 
